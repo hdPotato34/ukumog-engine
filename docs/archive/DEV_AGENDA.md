@@ -1,3 +1,5 @@
+> Archived note: this file is kept for project history only. The canonical current project document is [README.md](../../README.md).
+
 # Ukumog Engine Development Agenda
 
 This file is the working roadmap for the engine in this repo. It started from the original game brief and has been updated to reflect what the codebase now contains, what we learned while implementing it, and which ideas are worth pursuing next.

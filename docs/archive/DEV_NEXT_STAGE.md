@@ -1,3 +1,5 @@
+> Archived note: this file is kept for project history only. The canonical current project document is [README.md](../../README.md).
+
 # Ukumog Engine Stage 7 Tracker
 
 This file is the active engineering log for Stage 7. It replaces the earlier draft spec with a working tracker so implementation progress, measurement notes, and next tickets stay in one place.
