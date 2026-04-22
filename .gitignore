@@ -9,3 +9,5 @@ venv/
 .vscode/
 
 checkpoints/
+data/*_smoke.npz
+data/archive/

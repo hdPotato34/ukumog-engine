@@ -14,6 +14,7 @@ VALUE_SCORE_CLIP = 20_000.0
 VALUE_SCORE_SCALE = 4_000.0
 DATASET_KIND_KEY = "dataset_kind"
 DATASET_KIND_QUIET_VALUE_V1 = "quiet_value_v1"
+DATASET_KIND_ROOT_POLICY_V1 = "root_policy_v1"
 DATASET_KIND_LEGACY_POLICY_VALUE = "legacy_policy_value_v0"
 
 
@@ -38,6 +39,10 @@ def _dataset_kind_array(dataset_kind: str) -> np.ndarray:
 def _dataset_kind_from_loaded(data: np.lib.npyio.NpzFile) -> str:
     if DATASET_KIND_KEY in data.files:
         return str(np.asarray(data[DATASET_KIND_KEY]).item())
+    if "features" in data.files and "policy_targets" in data.files:
+        if "value_targets" in data.files:
+            return DATASET_KIND_LEGACY_POLICY_VALUE
+        return DATASET_KIND_ROOT_POLICY_V1
     if "features" in data.files:
         return DATASET_KIND_LEGACY_POLICY_VALUE
     if "four_states" in data.files and "five_states" in data.files:
@@ -52,6 +57,10 @@ def load_dataset_kind(path: str | Path) -> str:
 
 def _default_metadata_array(name: str, size: int) -> np.ndarray:
     if name == "scores":
+        return np.zeros(size, dtype=np.int32)
+    if name == "best_scores":
+        return np.zeros(size, dtype=np.int32)
+    if name == "score_gaps":
         return np.zeros(size, dtype=np.int32)
     if name == "search_depths":
         return np.full(size, -1, dtype=np.int16)
@@ -177,6 +186,63 @@ def append_quiet_value_examples(
     _append_dataset_arrays(output, DATASET_KIND_QUIET_VALUE_V1, core_arrays, extra_arrays=metadata)
 
 
+def save_root_policy_examples(
+    path: str | Path,
+    features: np.ndarray,
+    legal_masks: np.ndarray,
+    policy_targets: np.ndarray,
+    best_scores: np.ndarray | None = None,
+    score_gaps: np.ndarray | None = None,
+    search_depths: np.ndarray | None = None,
+    extra_arrays: dict[str, np.ndarray] | None = None,
+) -> None:
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    core_arrays: dict[str, np.ndarray] = {
+        "features": features.astype(np.float32, copy=False),
+        "legal_masks": legal_masks.astype(np.bool_, copy=False),
+        "policy_targets": policy_targets.astype(np.int64, copy=False),
+    }
+    metadata: dict[str, np.ndarray] = {}
+    if best_scores is not None:
+        metadata["best_scores"] = best_scores.astype(np.int32, copy=False)
+    if score_gaps is not None:
+        metadata["score_gaps"] = score_gaps.astype(np.int32, copy=False)
+    if search_depths is not None:
+        metadata["search_depths"] = search_depths.astype(np.int16, copy=False)
+    if extra_arrays is not None:
+        metadata.update(extra_arrays)
+    _merge_dataset_arrays(output, DATASET_KIND_ROOT_POLICY_V1, core_arrays, extra_arrays=metadata)
+
+
+def append_root_policy_examples(
+    path: str | Path,
+    features: np.ndarray,
+    legal_masks: np.ndarray,
+    policy_targets: np.ndarray,
+    best_scores: np.ndarray | None = None,
+    score_gaps: np.ndarray | None = None,
+    search_depths: np.ndarray | None = None,
+    extra_arrays: dict[str, np.ndarray] | None = None,
+) -> None:
+    output = Path(path)
+    core_arrays: dict[str, np.ndarray] = {
+        "features": features.astype(np.float32, copy=False),
+        "legal_masks": legal_masks.astype(np.bool_, copy=False),
+        "policy_targets": policy_targets.astype(np.int64, copy=False),
+    }
+    metadata: dict[str, np.ndarray] = {}
+    if best_scores is not None:
+        metadata["best_scores"] = best_scores.astype(np.int32, copy=False)
+    if score_gaps is not None:
+        metadata["score_gaps"] = score_gaps.astype(np.int32, copy=False)
+    if search_depths is not None:
+        metadata["search_depths"] = search_depths.astype(np.int16, copy=False)
+    if extra_arrays is not None:
+        metadata.update(extra_arrays)
+    _append_dataset_arrays(output, DATASET_KIND_ROOT_POLICY_V1, core_arrays, extra_arrays=metadata)
+
+
 def save_examples(
     path: str | Path,
     features: np.ndarray,
@@ -288,6 +354,57 @@ class NPZQuietValueDataset(Dataset[dict[str, torch.Tensor]]):
             "four_states": torch.from_numpy(self.four_states[index]),
             "five_states": torch.from_numpy(self.five_states[index]),
             "value_target": torch.tensor(self.value_targets[index], dtype=torch.float32),
+        }
+
+
+class NPZRootPolicyDataset(Dataset[dict[str, torch.Tensor]]):
+    def __init__(self, path: str | Path, symmetry_augment: bool = False) -> None:
+        self.path = Path(path)
+        data = np.load(self.path)
+        if _dataset_kind_from_loaded(data) != DATASET_KIND_ROOT_POLICY_V1:
+            raise ValueError("dataset is not a root_policy_v1 archive")
+
+        self.features = data["features"].astype(np.float32)
+        self.legal_masks = data["legal_masks"].astype(np.bool_)
+        self.policy_targets = data["policy_targets"].astype(np.int64)
+        self.symmetry_augment = symmetry_augment
+        self.metadata: dict[str, np.ndarray] = {}
+
+        if self.features.ndim != 4:
+            raise ValueError("features array must have shape [N, C, H, W]")
+        if self.features.shape[0] == 0:
+            raise ValueError("dataset is empty")
+        if self.legal_masks.shape != (self.features.shape[0], BOARD_CELLS):
+            raise ValueError("legal_masks array has the wrong shape")
+        if self.policy_targets.shape != (self.features.shape[0],):
+            raise ValueError("policy_targets array has the wrong shape")
+
+        standard_keys = {DATASET_KIND_KEY, "features", "legal_masks", "policy_targets"}
+        for key in data.files:
+            if key in standard_keys:
+                continue
+            values = np.asarray(data[key])
+            if values.shape and values.shape[0] != self.features.shape[0]:
+                raise ValueError(f"metadata array {key!r} has the wrong leading dimension")
+            self.metadata[key] = values
+
+    def __len__(self) -> int:
+        return int(self.features.shape[0])
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        features = self.features[index]
+        legal_mask = self.legal_masks[index]
+        policy_target = int(self.policy_targets[index])
+        if self.symmetry_augment:
+            symmetry = int(np.random.randint(0, 8))
+            features = transform_planes(features, symmetry)
+            legal_mask = transform_flat_mask(legal_mask, symmetry).astype(np.bool_, copy=False)
+            policy_target = transform_index(policy_target, symmetry)
+
+        return {
+            "features": torch.from_numpy(features),
+            "legal_mask": torch.from_numpy(legal_mask),
+            "policy_target": torch.tensor(policy_target, dtype=torch.long),
         }
 
 

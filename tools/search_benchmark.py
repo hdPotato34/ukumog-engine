@@ -44,7 +44,79 @@ IMMEDIATE_DOUBLE_THREAT = Position.from_rows(
     ]
 )
 
+RESTRICTED_THREAT_REPRO_ROWS = [
+    "....B......",
+    ".....B.....",
+    "...........",
+    "...B.......",
+    "..B.W.W....",
+    ".....B.....",
+    "....WWB....",
+    "...........",
+    "....W......",
+    "...........",
+    "...........",
+]
+
+RESTRICTED_THREAT_BASE_ROWS = [
+    "....B......",
+    ".....B.....",
+    "...........",
+    "...B.......",
+    "..B.W.W....",
+    "...........",
+    "....WWB....",
+    "...........",
+    "....W......",
+    "...........",
+    "...........",
+]
+
 QUIET_MIDGAME_HISTORY = [41, 19, 52, 86, 6, 10, 111, 73, 14, 51, 82, 8, 72, 32, 4, 16, 66, 64]
+
+
+def _transform_rows(rows: list[str], transform: str) -> list[str]:
+    if transform == "identity":
+        return list(rows)
+    if transform == "rot90":
+        size = len(rows)
+        return ["".join(rows[size - 1 - col][row] for col in range(size)) for row in range(size)]
+    if transform == "rot180":
+        return _transform_rows(_transform_rows(rows, "rot90"), "rot90")
+    if transform == "rot270":
+        return _transform_rows(_transform_rows(rows, "rot180"), "rot90")
+    if transform == "flip_h":
+        return [row[::-1] for row in rows]
+    raise ValueError(f"unknown transform: {transform}")
+
+
+def _swap_colors(rows: list[str]) -> list[str]:
+    swapped: list[str] = []
+    for row in rows:
+        swapped.append(row.replace("B", "x").replace("W", "B").replace("x", "W"))
+    return swapped
+
+
+def restricted_threat_positions() -> dict[str, Position]:
+    transforms = ("identity", "rot90", "rot180", "rot270", "flip_h")
+    positions = {
+        "restricted_threat_repro": Position.from_rows(RESTRICTED_THREAT_REPRO_ROWS, side_to_move=Color.WHITE),
+        "restricted_threat_repro_black": Position.from_rows(
+            _swap_colors(RESTRICTED_THREAT_REPRO_ROWS),
+            side_to_move=Color.BLACK,
+        ),
+    }
+    for transform in transforms:
+        suffix = "" if transform == "identity" else f"_{transform}"
+        positions[f"restricted_threat_midgame{suffix}"] = Position.from_rows(
+            _transform_rows(RESTRICTED_THREAT_BASE_ROWS, transform),
+            side_to_move=Color.WHITE,
+        )
+        positions[f"restricted_threat_midgame_black{suffix}"] = Position.from_rows(
+            _transform_rows(_swap_colors(RESTRICTED_THREAT_BASE_ROWS), transform),
+            side_to_move=Color.BLACK,
+        )
+    return positions
 
 
 def _position_from_history(history: list[int], side_to_move: Color = Color.BLACK) -> Position:
@@ -59,12 +131,14 @@ def _position_from_history(history: list[int], side_to_move: Color = Color.BLACK
 
 
 def benchmark_positions() -> dict[str, Position]:
-    return {
+    positions = {
         "initial": Position.initial(),
         "tactical_midgame": TACTICAL_MIDGAME,
         "immediate_double_threat": IMMEDIATE_DOUBLE_THREAT,
         "quiet_midgame": _position_from_history(QUIET_MIDGAME_HISTORY),
     }
+    positions.update(restricted_threat_positions())
+    return positions
 
 
 def run_benchmark(depth: int, time_ms: int | None, selected: list[str] | None = None) -> list[str]:
@@ -89,6 +163,11 @@ def run_benchmark(depth: int, time_ms: int | None, selected: list[str] | None = 
                     f"quiescence_s={stats.quiescence_time_seconds:.3f}",
                     f"proof_s={stats.proof_solver_time_seconds:.3f}",
                     f"qtt_hits={stats.qtt_hits}",
+                    f"qforced_single={stats.quiescence_single_forced_block_nodes}",
+                    f"qsafe_only={stats.quiescence_safe_threat_only_nodes}",
+                    f"qsafe_pruned={stats.quiescence_safe_threat_moves_pruned}",
+                    f"qskip_frontier={stats.quiescence_skip_frontier_safe_threat_nodes}",
+                    f"qskip_wide={stats.quiescence_skip_wide_safe_threat_nodes}",
                     f"futility_prunes={stats.futility_prunes}",
                     f"late_move_prunes={stats.late_move_prunes}",
                 ]

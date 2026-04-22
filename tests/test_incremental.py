@@ -200,6 +200,113 @@ class IncrementalStateTests(unittest.TestCase):
             {move: full.opponent_wins_after_move[move] for move in subset},
         )
 
+    def test_future_winning_moves_match_full_snapshot_for_subset(self) -> None:
+        for seed in range(6):
+            position = _random_nonterminal_position(3650 + seed, plies=11 + seed)
+            state = IncrementalState.from_position(position)
+            full = analyze_tactics(position, inc_state=state)
+            subset = tuple(full.safe_moves[: min(6, len(full.safe_moves))])
+
+            for move in subset:
+                self.assertEqual(
+                    state.future_winning_moves_from_move(move, position.side_to_move),
+                    full.future_wins_by_move[move],
+                    msg=f"seed={seed} move={move}",
+                )
+
+    def test_move_map_counts_match_full_snapshot_for_subset(self) -> None:
+        position = _random_nonterminal_position(3602, plies=13)
+        state = IncrementalState.from_position(position)
+        full = analyze_tactics(position, inc_state=state)
+        subset = tuple(full.safe_moves[: min(6, len(full.safe_moves))])
+
+        future_win_counts, opponent_remaining_counts = state.move_map_counts(
+            subset,
+            position.side_to_move,
+            candidate_moves=full.candidate_moves,
+        )
+
+        self.assertEqual(
+            future_win_counts,
+            {move: len(full.future_wins_by_move[move]) for move in subset},
+        )
+        self.assertEqual(
+            opponent_remaining_counts,
+            {move: len(full.opponent_wins_after_move[move]) for move in subset},
+        )
+
+    def test_move_maps_match_full_snapshot_for_forced_block_subset(self) -> None:
+        position = Position.from_rows(
+            [
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "W.W.W.W....",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+            ],
+            side_to_move=Color.BLACK,
+        )
+        state = IncrementalState.from_position(position)
+        full = analyze_tactics(position, inc_state=state)
+        subset = tuple(full.safe_moves[: min(4, len(full.safe_moves))])
+
+        future_wins_by_move, opponent_wins_after_move = state.move_maps(
+            subset,
+            position.side_to_move,
+            candidate_moves=full.candidate_moves,
+        )
+
+        self.assertEqual(
+            future_wins_by_move,
+            {move: full.future_wins_by_move[move] for move in subset},
+        )
+        self.assertEqual(
+            opponent_wins_after_move,
+            {move: full.opponent_wins_after_move[move] for move in subset},
+        )
+
+    def test_move_map_counts_match_full_snapshot_for_forced_block_subset(self) -> None:
+        position = Position.from_rows(
+            [
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "W.W.W.W....",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+            ],
+            side_to_move=Color.BLACK,
+        )
+        state = IncrementalState.from_position(position)
+        full = analyze_tactics(position, inc_state=state)
+        subset = tuple(full.safe_moves[: min(4, len(full.safe_moves))])
+
+        future_win_counts, opponent_remaining_counts = state.move_map_counts(
+            subset,
+            position.side_to_move,
+            candidate_moves=full.candidate_moves,
+        )
+
+        self.assertEqual(
+            future_win_counts,
+            {move: len(full.future_wins_by_move[move]) for move in subset},
+        )
+        self.assertEqual(
+            opponent_remaining_counts,
+            {move: len(full.opponent_wins_after_move[move]) for move in subset},
+        )
+
     def test_incremental_tactical_queries_match_known_forcing_position(self) -> None:
         position = Position.from_rows(
             [

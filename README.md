@@ -27,15 +27,17 @@ The current repo is not just scaffolding. These parts are implemented and covere
 * reversible incremental state with make/unmake and lookup-backed mask evaluation
 * selective tactical proof solver for sharp positions
 * CLI play and engine-vs-engine benchmarking with structured search summaries
+* desktop GUI play with a mouse-driven board, live engine configuration panels, and on-demand position analysis
 * quiet-position self-play data generation, mask-state value training, dataset inspection, and checkpoint loading
-* legacy CNN checkpoint loading for comparison runs against older experiments
+* legacy CNN checkpoint loading for comparison runs against older experiments and baseline tests
 * regression coverage for rules, tactical motifs, incremental parity, search behavior, and ML plumbing
 
 Current verification:
 
-* `python -m pytest -q` passes: `59 passed`
+* `python -m pytest -q` passes: `90 passed`
+* the current representative tactical benchmark now reaches `depth=8` in about `19-27s` with a `60000ms` budget, depending on local machine load
 * representative search summaries show tactics, quiescence, and proof work dominate wall time
-* static eval is now a small runtime share, and the primary ML path is now restricted to quiet-node value guidance
+* current documented ML baseline is root-policy on CPU, while quiet-value remains experimental
 
 ## What Is Outdated
 
@@ -56,10 +58,16 @@ Human vs engine:
 python play_cli.py --mode human-vs-engine --depth 4 --time 10
 ```
 
+Desktop GUI:
+
+```powershell
+python play_gui.py
+```
+
 Engine vs engine with instrumentation:
 
 ```powershell
-python play_cli.py --mode engine-vs-engine --depth 4 --time 0.5 --search-summary --time-trace
+python play_cli.py --mode engine-vs-engine --depth 4 --time 0.5 --device cpu --search-summary --time-trace
 ```
 
 Fixed benchmark suite:
@@ -68,258 +76,109 @@ Fixed benchmark suite:
 python tools/search_benchmark.py --depth 6
 ```
 
-Engine vs engine with a trained checkpoint:
+Engine vs engine with the best current documented ML checkpoint:
 
 ```powershell
-python play_cli.py --mode engine-vs-engine --depth 4 --time 0.5 --model checkpoints/quiet_value_v1.pt --ml-mode quiet-value
+python play_cli.py --mode engine-vs-engine --depth 4 --time 0.5 --device cpu --model checkpoints/phase7_baseline.pt --ml-mode auto
 ```
 
-Batch engine evaluation with random seeds and shuffled colors:
+Current strongest local equal-time profile:
 
 ```powershell
-python play_cli.py --mode engine-vs-engine --games 40 --shuffle-colors --seed 20260419 --seed-step 1 --temperature 0 --black-temperature 0 --white-temperature 0 --black-model checkpoints/quiet_value_v1.pt --white-model checkpoints/phase7_baseline.pt --black-ml-mode quiet-value --white-ml-mode root-policy --depth 4 --time 0.5
+python play_cli.py --mode engine-vs-engine --depth 6 --time 0.5 --device cpu --model checkpoints/phase7_ml_bigger_dense.pt --ml-mode auto
 ```
 
-Generate training data:
+Fair paired-color ML match suite against pure search:
 
 ```powershell
-python -m ukumog_engine.ml.generate_data --games 400 --play-depth 2 --label-depth 4 --play-time-ms 0 --label-time-ms 0 --sample-every 1 --sample-start-ply 0 --samples-per-game 4 --target-new-samples 300 --explore-plies 10 --explore-top-k 6 --diversify-opening-plies 8 --diversify-opening-top-k 10 --adaptive-stall-games 4 --adaptive-explore-step 2 --adaptive-explore-plies-step 2 --append-output --output data/quiet_value_v1.npz
+python tools/ml_match_suite.py --candidate-name Phase7Baseline --model checkpoints/phase7_baseline.pt --ml-mode auto --device cpu --depth 4
+```
+
+Fair paired-color search or search+ML suite with different candidate/baseline depths:
+
+```powershell
+python tools/ml_match_suite.py --candidate-name Depth6Dense --model checkpoints/phase7_ml_bigger_dense.pt --ml-mode auto --candidate-depth 6 --baseline-name Depth5 --baseline-depth 5 --time-controls 0.5
+```
+
+Diagnostic-only repeated batch from the initial position:
+
+```powershell
+python play_cli.py --mode engine-vs-engine --games 20 --shuffle-colors --seed 20260421 --seed-step 1 --temperature 0 --black-temperature 0 --white-temperature 0 --black-model checkpoints/phase7_baseline.pt --black-ml-mode auto --depth 4 --time 0.5 --device cpu
+```
+
+Generate root-policy training data:
+
+```powershell
+python -m ukumog_engine.ml.generate_root_policy_data --games 400 --play-depth 2 --label-depth 6 --label-time-ms 1500 --sample-every 2 --sample-start-ply 2 --temperature 0.8 --temperature-plies 8 --sample-top-k 4 --min-candidate-moves 4 --min-score-gap 50 --max-score-gap 4000 --output data/root_policy_v1.npz
+```
+
+Append new deduplicated root-policy samples to an existing dataset:
+
+```powershell
+python -m ukumog_engine.ml.generate_root_policy_data --games 200 --play-depth 2 --label-depth 6 --label-time-ms 1500 --sample-every 2 --sample-start-ply 2 --temperature 0.8 --temperature-plies 8 --sample-top-k 4 --min-candidate-moves 4 --min-score-gap 50 --max-score-gap 4000 --append-output --output data/root_policy_v1.npz
 ```
 
 Inspect a dataset:
 
 ```powershell
-python -m ukumog_engine.ml.inspect_data --data data/quiet_value_v1.npz
+python -m ukumog_engine.ml.inspect_data --data data/root_policy_v1.npz
 ```
 
-Train a model:
+Train a root-policy model:
 
 ```powershell
-python -m ukumog_engine.ml.train --data data/quiet_value_v1.npz --output checkpoints/quiet_value_v1.pt --epochs 12 --batch-size 128 --learning-rate 3e-4 --accumulator-width 64 --hidden-width 32 --split-group auto
+python -m ukumog_engine.ml.train_root_policy --data data/root_policy_v1.npz --output checkpoints/root_policy_v1.pt --epochs 12 --batch-size 128 --learning-rate 3e-4 --trunk-channels 56 --blocks 5 --policy-channels 24 --split-group auto --device auto
+```
+
+Experimental quiet-value run:
+
+```powershell
+python play_cli.py --mode engine-vs-engine --depth 4 --time 0.5 --device cpu --model checkpoints/quiet_value_v2.pt --ml-mode auto --learned-weight 0.1
 ```
 
 Notes:
 
+* `play_cli.py` now supports `--ml-mode auto` and `--device {cpu,cuda,auto}`. `auto` resolves quiet-value checkpoints to `quiet-value` and policy checkpoints to `root-policy`.
+* `play_gui.py` keeps the existing engine configuration surface interactive: mouse play on the board, black/white engine panels, `Analyze` for current-position eval plus top moves, and `Start Autoplay` for engine-vs-engine games.
+* the GUI now defaults to `human-vs-human` plain-board mode so you can build a position move by move, jump around the move timeline with `Start` / `Prev` / `Next` / `End`, and analyze the current board state without the engine auto-replying.
+* analysis now surfaces a dedicated recommended move line and highlights that move directly on the board.
+* the right-side engine settings area is both scrollable and collapsible to behave better at tighter window sizes or higher zoom.
+* the GUI currently keeps board size fixed at `11x11`; the engine core, tests, and ML stack are still written around that size.
 * `play_cli.py` supports `--search-summary`, `--stats-jsonl`, `--time-trace`, side-specific depth/time/model overrides, and opening sampling controls.
 * `tools/search_benchmark.py` runs the fixed search-tuning position set: `initial`, `tactical_midgame`, `immediate_double_threat`, and `quiet_midgame`.
-* `play_cli.py` can now run repeated engine-vs-engine batches with `--games`, `--shuffle-colors`, and per-game seed stepping, then report a final win-rate summary.
-* the primary ML runtime mode is now `quiet-value`, which only blends learned scores into quiet non-quiescent nodes.
-* `ukumog_engine.ml.generate_data` now emits a `quiet_value_v1` dataset made from mask-state features, skips tactical positions, filters mate-like labels, and appends incrementally by default.
-* the generator now buffers quiet candidates per game, labels only the best few, supports `--target-new-samples`, diversifies opening play, and adapts exploration when append yield stalls.
-* `ukumog_engine.ml.train` now trains a shallow NNUE-style value net over the 4-mask and 5-mask ternary states already tracked by `IncrementalState`.
-* the previous board-CNN policy/value workflow is still loadable for comparison via legacy checkpoints, but it is no longer the primary documented training path.
+* `tools/ml_match_suite.py` is the recommended strength check. It uses 8 deterministic opening-prefix positions plus `quiet_midgame` and `tactical_midgame`, pairs both color assignments at `0.5s` and `1.0s`, and now supports separate `--candidate-depth` and `--baseline-depth` overrides.
+* `temperature=0` engine batches are useful for debugging or reproducing one opening, but they are no longer the recommended strength-evaluation command.
+* the primary documented ML runtime path is now root-policy on CPU, with `checkpoints/phase7_baseline.pt` as the current documented checkpoint until a new `root_policy_v1` model clears the suite.
+* the strongest local equal-time result currently on record is `checkpoints/phase7_ml_bigger_dense.pt` at `depth=6`, which scored `13-7` (`65%`) against pure `depth=5` on the full 20-game paired suite at `0.5s`.
+* `ukumog_engine.ml.generate_root_policy_data` builds `root_policy_v1` from ambiguous root decisions rather than generic board snapshots, and `--append-output` deduplicates against existing `canonical_hashes` before extending a dataset.
+* `ukumog_engine.ml.train_root_policy` trains a policy-only dense CNN over the existing 15-plane encoder with symmetry augmentation and canonical-hash validation splits.
+* the quiet-value path remains available, but it is experimental and should be run with an explicit low blend such as `--learned-weight 0.1`.
 
-## Short History
+## Compatibility
 
-The engine has progressed in a sensible order:
+Legacy checkpoints and their client/runtime compatibility are intentionally preserved:
 
-* rules and mask generation first
-* baseline alpha-beta search next
-* tactical reasoning layered on top
-* reversible incremental state and lookup-backed eval after profiling showed repeated recomputation
-* supervised ML pipeline added after the search core was already functional
-* first policy-first CNN experiments retired as the primary path after they failed to show reproducible match gains
-* quiet-value mask-state evaluation introduced as the current ML baseline
+* `phase7_baseline.pt` stays in place as the baseline comparison model
+* older policy/value checkpoints still load through the current evaluator path
+* quiet-value tooling remains available for experimental comparisons
+* the current command-line workflow remains supported alongside the new desktop GUI entrypoint
 
-That ordering still looks right. The repo is strongest where it stayed symbolic and exact.
+Archived legacy workflow notes:
 
-## Critical Review
-
-What is genuinely strong:
-
-* exact move classification and tactical legality handling
-* search-side structure and pruning discipline
-* reversible incremental bookkeeping
-* instrumentation good enough to guide the next stage
-
-What is currently weaker or riskier:
-
-* the new quiet-value path is structurally better aligned with the engine, but it still has to prove reproducible equal-time gains over pure search
-* the current label source is still search supervision, so quiet-sample quality and depth discipline matter more than raw sample count
-* the first-pass mask evaluator does not yet carry a true search-stack accumulator
-
-Evidence from the shipped datasets:
-
-* older policy-first datasets were heavily tactical and mate-skewed, which made them poor targets for a quiet evaluator
-* the new `quiet_value_v1` builder removes immediate wins, forced blocks, safe threats, double threats, opponent threats, and mate-like labels before writing samples
-* validation now splits by canonical position metadata by default, which makes leakage much harder
-
-Implication:
-
-* the current learned model should be treated as a quiet-node helper only, not as evidence that the engine should become ML-led
-
-## Idea Review
-
-Opening base or shallow first 3-5 moves in the center 5x5:
-
-* medium value for training-data generation efficiency and early-position diversity
-* low-to-medium value for engine strength right now
-* recommended use: canonicalized opening seeds for self-play, not a major standalone engine feature
-
-Rotation and mirroring:
-
-* still useful for deduplication and canonical hashing
-* less central to the new primary model, because the quiet-value pipeline is mask-state based rather than board-plane augmentation led
-
-Current ML evaluation overfitting:
-
-* high-priority problem
-* the current response is a full reset toward quiet-only mask-state value learning
-* remaining fixes should focus on quieter labels, deeper search supervision, and eventual accumulator-style inference
-
-Self-evolution once ML beats pure search:
-
-* defer
-* revisit only after the model proves equal-time match gains in root or quiet-PV usage without tactical regression
-
-Caching positions across games during one training session:
-
-* medium value if implemented as a symmetry-canonical label cache in data generation
-* low value as a vague global cache without measured repeat rate and clear invalidation rules
-
-## Recommended Next Curriculum
-
-1. Reduce tactical, quiescence, and proof-solver overhead while improving quiet-node selectivity.
-2. Tighten measurement discipline around equal-time matches, search summaries, and reproducible benchmark settings.
-3. Refactor dataset generation toward quiet, disagreement-heavy, and less-correlated positions.
-4. Add a true search-stack accumulator to the quiet-value evaluator after the current mask-state path proves useful.
-5. Re-test ML only as a quiet-node eval aid after the stronger dataset exists.
-
-## Next-Stage Direction
-
-If the target is "closer to Stockfish," the practical reading is:
-
-* search remains the engine
-* tactical correctness remains exact
-* incremental state and pruning quality matter more than bigger models
-* ML must earn its place through measured equal-time gain, not offline loss alone
-
-That means the next stage should optimize for deeper and more efficient search first, then bring ML back in only where the search instrumentation says it helps.
-
-## Search Review: 2026-04-20
-
-What Stockfish is really doing when it reaches depth 20+ quickly:
-
-* the reported depth is selective depth, not full-width brute force
-* the official Stockfish docs explicitly center aggressive pruning and reductions such as null-move pruning, futility pruning, late-move pruning, and late-move reductions
-* official Stockfish docs also note that aggressive pruning lowers effective branching factor dramatically; even small branching-factor improvements compound into huge node savings
-* Stockfish also benefits from highly optimized native code, very cheap move generation, tight incremental state, and SMP search
-
-What the current Ukumog search already has:
-
-* iterative deepening
-* alpha-beta negamax with PVS and aspiration windows
-* transposition table in the main search
-* killer/history ordering
-* late-move reductions
-* tactical quiescence
-* selective tactical proof search
-* reversible incremental state and incremental lookup eval
-
-What local profiling says is still expensive:
-
-* `ukumog_engine/search.py` spends most time inside `_tactics`, `_quiescence`, and `_tactical_proof`
-* after Stage 5, the hot inner loops are still in `ukumog_engine/incremental.py`, especially `paired_tactical_summaries`, `_future_winning_bits_from_move`, and subset move-map derivation
-* make/unmake is not the main problem right now; tactical summary generation is
-
-Representative local pure-search measurements on one tactical midgame position:
-
-* before the first cache fix: depth 4 about `2.0s`, depth 5 about `4.5s`, depth 6 about `55.0s`
-* first low-risk fix landed on `2026-04-20`: full tactical snapshots now satisfy later lite-snapshot requests from the cache
-* after that fix on the same position: depth 5 about `2.9s`, depth 6 about `34.2s`
-* Stage 1 landed on `2026-04-20`: light tactical snapshots now skip building per-move future-win maps up front, search/proof paths request light snapshots by default, and exact move maps are generated lazily only when move ordering needs them
-* after Stage 1 on the same position: depth 5 about `2.8s`, depth 6 about `31.4s`
-* Stage 2 landed on `2026-04-20`: conservative futility pruning and late-move pruning now skip quiet non-PV tail work while preserving exact tactical handling on urgent nodes
-* after Stage 2 on the same position: depth 5 about `2.0s`, depth 6 about `6.7s`, depth 7 about `37.9s`
-* Stage 2 makes deeper search materially more realistic, but it also exposes the next bottleneck clearly: tactical proof activations still explode on sharp lines
-* Stage 3 landed on `2026-04-20`: tactical proof search is now gated much more tightly on non-PV and deeper side branches, while staying active on PV and near-root forcing lines
-* after Stage 3 on the same position: depth 6 about `5.1s`, depth 7 about `24.2s`
-* a depth-8 probe on that same position still did not fully finish within `60s`, but the engine now completes depth 7 inside that budget and proof time becomes almost negligible there
-* Stage 4 landed on `2026-04-20`: quiescence now has a dedicated hash table with bound reuse and hash-move ordering, which cuts repeated horizon work without mixing q-search entries into the main TT
-* after Stage 4 on the same position: depth 6 about `5.0s`, depth 7 about `24.5s`
-* Stage 4 is a modest gain rather than a breakthrough, but q-hash hits are real and horizon overhead is now cleaner to measure
-* Stage 5 landed on `2026-04-21`: tactical summaries now use an explicit `BASIC` vs `ORDERING` split, poison detection is derived in bulk, and exact ordering maps are reserved for the quiet subset instead of broad tactical buckets
-* after Stage 5 on the same position: depth 6 about `3.0s`
-* Stage 5 is the first tactical-summary refactor that clearly beats the Stage 4 tactical-midgame baseline
-* the improvement is real, but it is still nowhere near enough for comfortable depth-8 search on sharp positions
-
-Current orientation after Stage 5:
-
-* the biggest wins came from pruning, proof-solver gating, and now the first real tactical-summary refactor
-* proof search is no longer the main problem on representative sharp midgames
-* static eval is not the problem
-* the primary wall is still tactical summary generation plus quiescence work on positions that are sharp enough to stay tactical, but not forcing enough to collapse immediately
-* exact ordering maps are now much better targeted, so the next gains should come from cheaper basic tactical summaries and tighter non-PV quiescence selectivity
-
-Small benchmark set snapshot at depth 6:
-
-* opening-like root (`Position.initial()`): about `0.54s`, total nodes about `1680`, proof time effectively `0s`
-* representative tactical midgame: about `3.0s`, total nodes about `8868`, tactics about `1.9s`, quiescence about `1.8s`, proof about `0.02s`
-* immediate double-threat win: essentially solved instantly, total nodes about `6`
-* quiet midgame from the search tests: about `0.87s`, total nodes about `3718`
-
-Interpretation:
-
-* the engine already handles truly forcing positions well
-* the remaining hard class is the "wide tactical midgame" where many safe threats and tactical continuations still exist
-* that means the next direction still should not be more generic pruning first
-* it should be a second tactical-efficiency pass aimed at cheaper basic summaries and narrower non-PV quiescence work
-
-Important caution on "borrow Stockfish tech":
-
-* null-move pruning is one of Stockfish's biggest weapons, but it should not be copied blindly here
-* this game is pure tempo and threat creation, and illegal-pass assumptions may be much less safe than in chess
-* safer first ports are quiescence TT support, stronger quiet-node pruning, better move-order histories, and tactical-pipeline laziness
-
-Revised implementation order after Stage 5:
-
-1. Tighten the basic tactical-summary pass further.
-   Focus on reducing repeated future-win and opponent-reply derivation inside `paired_tactical_summaries` and subset move-map generation.
-2. Tighten quiescence candidate selection further on non-PV nodes.
-   Focus on reducing broad safe-threat expansions that rarely change the bound.
-3. Improve tactical move ordering inside the remaining sharp nodes.
-   Good candidates: continuation/countermove history, stronger reuse of prior PV/hash moves, and tactical bucket ordering that does less per-move work.
-4. Add a small fixed benchmark suite to the repo workflow.
-   Opening, wide tactical midgame, immediate forcing win, and one quiet midgame should become the standard timing set before further search changes land.
-5. Re-profile the hottest incremental tactical functions before doing another search rewrite.
-   Right now `paired_tactical_summaries`, `_future_winning_bits_from_move`, and subset move-map derivation deserve the most scrutiny.
-6. Only after the tactical-summary path is lighter should we decide whether native acceleration is warranted for the hottest loops.
-7. Keep ML out of the critical path until the search-side bottlenecks above flatten further.
-
-What is effectively complete for this phase:
-
-* light-vs-full tactical snapshot split
-* tactical cache reuse across full and lite requests
-* conservative quiet-node futility and late-move pruning
-* aggressive proof-solver gating on non-PV/deeper side branches
-* quiescence TT groundwork
-* first tactical-summary tier refactor with subset-only ordering maps
-
-What should not be the immediate next bet:
-
-* null-move pruning
-* more generic pruning without new tactical evidence
-* another round of eval micro-optimization
-* ML-led search guidance as a substitute for tactical selectivity
-
-Practical expectation:
-
-* depth 8 in seconds will not come from one trick
-* it will come from lowering the effective branching factor, reducing tactical recomputation, and being much more selective about which quiet and tactical branches deserve full work
-* the engine is already structurally close enough to a Stockfish-style searcher that this is a realistic path
-* the next work should stay search-first and measurement-first
-
-Suggested benchmark discipline for this phase:
-
-* maintain a small fixed set of opening, quiet-midgame, and tactical-midgame positions
-* track depth, wall time, total nodes, average searched moves, quiescence share, proof-solver share, and tactics cache hit rate
-* treat "same strength at lower time" or "more depth at same time" as the main success criteria, not raw node count alone
+* [LEGACY_ML_WORKFLOWS.md](docs/archive/LEGACY_ML_WORKFLOWS.md)
+* [README_HISTORY_20260421.md](docs/archive/README_HISTORY_20260421.md)
+* [SEARCH_ENGINE_DEVLOG.md](docs/SEARCH_ENGINE_DEVLOG.md)
+* [GUI_DEVLOG.md](docs/GUI_DEVLOG.md)
 
 ## Archived Logs
 
 The previous working logs were intentionally moved out of the repo root:
 
+* [SEARCH_ENGINE_DEVLOG.md](docs/SEARCH_ENGINE_DEVLOG.md)
 * [DEV_AGENDA.md](docs/archive/DEV_AGENDA.md)
 * [DEV_NEXT_STAGE.md](docs/archive/DEV_NEXT_STAGE.md)
+* [LEGACY_ML_WORKFLOWS.md](docs/archive/LEGACY_ML_WORKFLOWS.md)
+* [README_HISTORY_20260421.md](docs/archive/README_HISTORY_20260421.md)
+* [GUI_DEVLOG.md](docs/GUI_DEVLOG.md)
 
-They remain useful as historical notes, but `README.md` is now the single authoritative project document.
+The archive files remain useful as historical notes. `README.md` stays the top-level project document, and `docs/SEARCH_ENGINE_DEVLOG.md` is the active search-specific planning log.

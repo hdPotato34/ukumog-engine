@@ -1,24 +1,33 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import random
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import numpy as np
 import torch
 
 import play_cli
+from tools import ml_match_suite
 from ukumog_engine import Color, Position, SearchEngine
 from ukumog_engine.ml.data import (
     DATASET_KIND_QUIET_VALUE_V1,
+    DATASET_KIND_ROOT_POLICY_V1,
+    NPZRootPolicyDataset,
     NPZQuietValueDataset,
+    append_root_policy_examples,
     append_quiet_value_examples,
     load_dataset_kind,
+    save_root_policy_examples,
     save_quiet_value_examples,
 )
 from ukumog_engine.ml.features import FEATURE_CHANNELS, encode_position
 from ukumog_engine.ml.generate_data import _effective_search_budget, collect_selfplay_examples
+from ukumog_engine.ml.generate_root_policy_data import collect_root_policy_examples
 from ukumog_engine.ml.inference import TorchPolicyValueEvaluator
 from ukumog_engine.ml.inspect_data import inspect_dataset
 from ukumog_engine.ml.mask_features import (
@@ -28,10 +37,13 @@ from ukumog_engine.ml.mask_features import (
 )
 from ukumog_engine.ml.model import (
     MODEL_KIND_MASK_VALUE_V1,
+    MODEL_KIND_ROOT_POLICY_V1,
     LegacyModelConfig,
     ModelConfig,
+    RootPolicyModelConfig,
     UkumogMaskValueNet,
     UkumogPolicyValueNet,
+    UkumogRootPolicyNet,
 )
 from ukumog_engine.ml.symmetry import (
     canonical_position_hash,
@@ -42,6 +54,7 @@ from ukumog_engine.ml.symmetry import (
     transform_position,
 )
 from ukumog_engine.ml.train import _split_dataset_indices, train_model
+from ukumog_engine.ml.train_root_policy import train_root_policy_model
 from ukumog_engine.tactics import analyze_tactics
 
 
@@ -71,6 +84,20 @@ def _synthetic_quiet_arrays(sample_count: int) -> tuple[np.ndarray, np.ndarray, 
         four_states[index, index % FOUR_MASK_COUNT] = np.uint8((index % 3) + 1)
         five_states[index, index % FIVE_MASK_COUNT] = np.uint8((index % 5) + 1)
     return four_states, five_states, value_targets
+
+
+def _synthetic_root_policy_arrays(sample_count: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    features = np.zeros((sample_count, FEATURE_CHANNELS, 11, 11), dtype=np.float32)
+    legal_masks = np.zeros((sample_count, 121), dtype=np.bool_)
+    policy_targets = np.zeros((sample_count,), dtype=np.int64)
+    for index in range(sample_count):
+        move = (60 + index) % 121
+        features[index, 0, index % 11, (index * 2) % 11] = 1.0
+        features[index, 2] = 1.0
+        legal_masks[index, move] = True
+        legal_masks[index, (move + 1) % 121] = True
+        policy_targets[index] = move
+    return features, legal_masks, policy_targets
 
 
 class MLFeatureTests(unittest.TestCase):
@@ -150,6 +177,19 @@ class MLFeatureTests(unittest.TestCase):
         self.assertIn("tactics_time_seconds", result.to_dict()["stats"])
         self.assertIn("ml calls=", result.format_summary())
 
+    def test_search_root_analysis_is_deterministic(self) -> None:
+        engine = SearchEngine()
+        first = engine.search(Position.initial(), max_depth=1, analyze_root=True)
+        second = engine.search(Position.initial(), max_depth=1, analyze_root=True)
+
+        first_scores = [(entry.move, entry.score) for entry in first.root_move_scores]
+        second_scores = [(entry.move, entry.score) for entry in second.root_move_scores]
+
+        self.assertTrue(first_scores)
+        self.assertEqual(first_scores, second_scores)
+        self.assertEqual(first.root_move_scores[0].move, first.best_move)
+        self.assertEqual(first.to_dict()["root_move_scores"][0]["move"], first.root_move_scores[0].move)
+
 
 class MLDatasetTests(unittest.TestCase):
     def test_effective_search_budget_can_use_opening_override(self) -> None:
@@ -201,6 +241,34 @@ class MLDatasetTests(unittest.TestCase):
         self.assertIn("canonical_hashes", dataset.metadata)
         self.assertEqual(dataset_kind, DATASET_KIND_QUIET_VALUE_V1)
 
+    def test_root_policy_dataset_round_trip(self) -> None:
+        features, legal_masks, policy_targets = _synthetic_root_policy_arrays(2)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "tiny_root_policy.npz"
+            save_root_policy_examples(
+                path,
+                features,
+                legal_masks,
+                policy_targets,
+                best_scores=np.array([120, 90], dtype=np.int32),
+                score_gaps=np.array([60, 55], dtype=np.int32),
+                search_depths=np.array([6, 6], dtype=np.int16),
+                extra_arrays={
+                    "game_ids": np.array([0, 1], dtype=np.int32),
+                    "canonical_hashes": np.array([33, 44], dtype=np.uint64),
+                },
+            )
+            dataset = NPZRootPolicyDataset(path)
+            dataset_kind = load_dataset_kind(path)
+
+        self.assertEqual(len(dataset), 2)
+        sample = dataset[0]
+        self.assertEqual(sample["features"].shape, (FEATURE_CHANNELS, 11, 11))
+        self.assertEqual(sample["legal_mask"].shape[0], 121)
+        self.assertIn("canonical_hashes", dataset.metadata)
+        self.assertEqual(dataset_kind, DATASET_KIND_ROOT_POLICY_V1)
+
     def test_append_quiet_value_examples_extends_existing_dataset(self) -> None:
         four_states, five_states, value_targets = _synthetic_quiet_arrays(1)
 
@@ -227,6 +295,43 @@ class MLDatasetTests(unittest.TestCase):
                 },
             )
             dataset = NPZQuietValueDataset(path)
+
+        self.assertEqual(len(dataset), 2)
+        self.assertEqual(dataset.metadata["game_ids"].tolist(), [0, 1])
+        self.assertEqual(dataset.metadata["canonical_hashes"].tolist(), [11, 22])
+
+    def test_append_root_policy_examples_extends_existing_dataset(self) -> None:
+        features, legal_masks, policy_targets = _synthetic_root_policy_arrays(1)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "appendable_root_policy.npz"
+            save_root_policy_examples(
+                path,
+                features,
+                legal_masks,
+                policy_targets,
+                best_scores=np.array([120], dtype=np.int32),
+                score_gaps=np.array([60], dtype=np.int32),
+                search_depths=np.array([6], dtype=np.int16),
+                extra_arrays={
+                    "game_ids": np.array([0], dtype=np.int32),
+                    "canonical_hashes": np.array([np.uint64(11)], dtype=np.uint64),
+                },
+            )
+            append_root_policy_examples(
+                path,
+                features,
+                legal_masks,
+                np.array([(policy_targets[0] + 1) % 121], dtype=np.int64),
+                best_scores=np.array([80], dtype=np.int32),
+                score_gaps=np.array([55], dtype=np.int32),
+                search_depths=np.array([5], dtype=np.int16),
+                extra_arrays={
+                    "game_ids": np.array([1], dtype=np.int32),
+                    "canonical_hashes": np.array([np.uint64(22)], dtype=np.uint64),
+                },
+            )
+            dataset = NPZRootPolicyDataset(path)
 
         self.assertEqual(len(dataset), 2)
         self.assertEqual(dataset.metadata["game_ids"].tolist(), [0, 1])
@@ -297,6 +402,49 @@ class MLDatasetTests(unittest.TestCase):
         self.assertIn("canonical_hashes", dataset.metadata)
         self.assertEqual(len(set(dataset.metadata["canonical_hashes"].tolist())), len(dataset.metadata["canonical_hashes"]))
 
+    def test_collect_root_policy_examples_can_append_output_without_duplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "incremental_root_policy.npz"
+            first_total = collect_root_policy_examples(
+                games=1,
+                seed=3,
+                play_depth=1,
+                label_depth=1,
+                output_path=path,
+                play_time_ms=0,
+                label_time_ms=0,
+                sample_every=1,
+                sample_start_ply=2,
+                max_positions=4,
+                min_candidate_moves=2,
+                min_score_gap=0,
+                max_score_gap=1_000_000,
+                append_output=True,
+            )
+            second_total = collect_root_policy_examples(
+                games=1,
+                seed=3,
+                play_depth=1,
+                label_depth=1,
+                output_path=path,
+                play_time_ms=0,
+                label_time_ms=0,
+                sample_every=1,
+                sample_start_ply=2,
+                max_positions=4,
+                min_candidate_moves=2,
+                min_score_gap=0,
+                max_score_gap=1_000_000,
+                append_output=True,
+            )
+            dataset = NPZRootPolicyDataset(path)
+
+        self.assertGreaterEqual(first_total, 0)
+        self.assertGreaterEqual(second_total, 0)
+        self.assertEqual(len(dataset), first_total + second_total)
+        hashes = dataset.metadata["canonical_hashes"].tolist()
+        self.assertEqual(len(set(hashes)), len(hashes))
+
     def test_collect_selfplay_examples_respects_samples_per_game(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "one_per_game.npz"
@@ -365,6 +513,31 @@ class MLInferenceTests(unittest.TestCase):
         self.assertFalse(evaluator.supports_policy)
         self.assertTrue(evaluator.quiet_value_only)
 
+    def test_torch_evaluator_loads_root_policy_checkpoint_and_defaults_to_root_policy(self) -> None:
+        model = UkumogRootPolicyNet(RootPolicyModelConfig(trunk_channels=16, residual_blocks=1, policy_channels=8))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint_path = Path(tmpdir) / "root_policy.pt"
+            torch.save(
+                {
+                    "model_kind": MODEL_KIND_ROOT_POLICY_V1,
+                    "dataset_kind": DATASET_KIND_ROOT_POLICY_V1,
+                    "model_state": model.state_dict(),
+                    "model_config": model.config.to_dict(),
+                },
+                checkpoint_path,
+            )
+            evaluator = TorchPolicyValueEvaluator.from_checkpoint(checkpoint_path, device="cpu")
+            priors = evaluator.move_priors(Position.initial(), [60, 61])
+            score = evaluator.evaluate(Position.initial())
+
+        self.assertIsInstance(score, int)
+        self.assertTrue(evaluator.supports_policy)
+        self.assertFalse(evaluator.quiet_value_only)
+        self.assertEqual(evaluator.default_ml_mode, "root-policy")
+        self.assertIn(60, priors)
+        self.assertIn(61, priors)
+
     def test_torch_evaluator_loads_legacy_dense_checkpoint_config(self) -> None:
         model = UkumogPolicyValueNet(
             LegacyModelConfig(
@@ -411,6 +584,7 @@ class MLInferenceTests(unittest.TestCase):
         self.assertIsInstance(score, int)
         self.assertIn(60, priors)
         self.assertTrue(evaluator.supports_policy)
+        self.assertEqual(evaluator.default_ml_mode, "root-policy")
 
     def test_symmetry_helpers_round_trip_indices(self) -> None:
         move = 17
@@ -506,6 +680,38 @@ class MLTrainingTests(unittest.TestCase):
         self.assertEqual(saved["dataset_kind"], DATASET_KIND_QUIET_VALUE_V1)
         self.assertIn("best_val_loss", saved)
 
+    def test_train_root_policy_model_saves_policy_checkpoint(self) -> None:
+        features, legal_masks, policy_targets = _synthetic_root_policy_arrays(8)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_path = Path(tmpdir) / "train_root_policy.npz"
+            output_path = Path(tmpdir) / "root_policy.pt"
+            save_root_policy_examples(
+                data_path,
+                features,
+                legal_masks,
+                policy_targets,
+                best_scores=np.arange(8, dtype=np.int32),
+                score_gaps=np.full(8, 60, dtype=np.int32),
+                search_depths=np.full(8, 6, dtype=np.int16),
+                extra_arrays={"canonical_hashes": np.arange(8, dtype=np.uint64)},
+            )
+            checkpoint = train_root_policy_model(
+                data_path=data_path,
+                output_path=output_path,
+                epochs=1,
+                batch_size=4,
+                learning_rate=1e-3,
+                device="cpu",
+                model_config=RootPolicyModelConfig(trunk_channels=16, residual_blocks=1, policy_channels=8),
+            )
+            saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
+
+        self.assertEqual(checkpoint, output_path)
+        self.assertEqual(saved["model_kind"], MODEL_KIND_ROOT_POLICY_V1)
+        self.assertEqual(saved["dataset_kind"], DATASET_KIND_ROOT_POLICY_V1)
+        self.assertIn("best_val_loss", saved)
+
 
 class DatasetInspectorTests(unittest.TestCase):
     def test_inspect_dataset_reports_quiet_value_summary(self) -> None:
@@ -527,6 +733,28 @@ class DatasetInspectorTests(unittest.TestCase):
         self.assertEqual(summary["dataset_kind"], DATASET_KIND_QUIET_VALUE_V1)
         self.assertEqual(summary["sample_count"], 3)
         self.assertEqual(summary["quiet_ratio"], 1.0)
+        self.assertEqual(summary["canonical_duplicate_count"], 0)
+        self.assertEqual(summary["search_depth_counts"], {5: 1, 6: 2})
+
+    def test_inspect_dataset_reports_root_policy_summary(self) -> None:
+        features, legal_masks, policy_targets = _synthetic_root_policy_arrays(3)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "inspect_root_policy.npz"
+            save_root_policy_examples(
+                path,
+                features,
+                legal_masks,
+                policy_targets,
+                best_scores=np.array([100, -200, 300], dtype=np.int32),
+                score_gaps=np.array([60, 75, 90], dtype=np.int32),
+                search_depths=np.array([6, 6, 5], dtype=np.int16),
+                extra_arrays={"canonical_hashes": np.array([1, 2, 3], dtype=np.uint64)},
+            )
+            summary = inspect_dataset(path)
+
+        self.assertEqual(summary["dataset_kind"], DATASET_KIND_ROOT_POLICY_V1)
+        self.assertEqual(summary["sample_count"], 3)
         self.assertEqual(summary["canonical_duplicate_count"], 0)
         self.assertEqual(summary["search_depth_counts"], {5: 1, 6: 2})
 
@@ -570,13 +798,16 @@ class CLITests(unittest.TestCase):
                 "--time-trace",
                 "--stats-jsonl",
                 "logs/search.jsonl",
+                "--device",
+                "cpu",
             ]
         )
         self.assertEqual(args.mode, "engine-vs-engine")
         self.assertEqual(args.games, 6)
         self.assertTrue(args.shuffle_colors)
         self.assertEqual(args.ml_mode, "quiet-value")
-        self.assertEqual(args.learned_weight, 0.25)
+        self.assertEqual(args.learned_weight, 0.10)
+        self.assertEqual(args.device, "cpu")
         self.assertEqual(args.black_depth, 2)
         self.assertEqual(args.white_depth, 3)
         self.assertEqual(args.black_time, 1.5)
@@ -594,6 +825,39 @@ class CLITests(unittest.TestCase):
         self.assertTrue(args.time_trace)
         self.assertEqual(args.stats_jsonl, Path("logs/search.jsonl"))
 
+    def test_build_engine_controller_auto_resolves_mode_and_device(self) -> None:
+        model = UkumogRootPolicyNet(RootPolicyModelConfig(trunk_channels=16, residual_blocks=1, policy_channels=8))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint_path = Path(tmpdir) / "root_policy.pt"
+            torch.save(
+                {
+                    "model_kind": MODEL_KIND_ROOT_POLICY_V1,
+                    "dataset_kind": DATASET_KIND_ROOT_POLICY_V1,
+                    "model_state": model.state_dict(),
+                    "model_config": model.config.to_dict(),
+                },
+                checkpoint_path,
+            )
+            controller = play_cli._build_engine_controller(
+                color=Color.BLACK,
+                model_path=checkpoint_path,
+                ml_mode="auto",
+                device="cpu",
+                depth=1,
+                time_seconds=0.0,
+                learned_weight=0.10,
+                temperature=0.0,
+                symmetry_ensemble=False,
+            )
+
+        self.assertEqual(controller.ml_mode, "root-policy")
+        self.assertEqual(controller.device, "cpu")
+        self.assertEqual(controller.engine.learned_policy_max_ply, 0)
+        self.assertEqual(controller.engine.learned_value_max_ply, -1)
+        self.assertEqual(controller.learned_weight, 0.0)
+        self.assertEqual(controller.engine.learned_evaluator.device.type, "cpu")
+
     def test_append_stats_record_writes_jsonl(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = Path(tmpdir) / "stats" / "search.jsonl"
@@ -607,6 +871,7 @@ class CLITests(unittest.TestCase):
             color=Color.BLACK,
             model_path=None,
             ml_mode="quiet-value",
+            device="cpu",
             depth=1,
             time_seconds=0.0,
             learned_weight=0.0,
@@ -632,6 +897,7 @@ class CLITests(unittest.TestCase):
             color=Color.BLACK,
             model_path=None,
             ml_mode="quiet-value",
+            device="cpu",
             depth=1,
             time_seconds=0.0,
             learned_weight=0.0,
@@ -675,6 +941,76 @@ class CLITests(unittest.TestCase):
         engine_b = play_cli._engine_spec_for_color(args, Color.WHITE, "Engine B")
         result = play_cli._run_engine_batch(args, engine_a, engine_b)
         self.assertEqual(result, 0)
+
+    def test_main_human_vs_engine_runs_engine_turn_without_budget_type_errors(self) -> None:
+        stdout = io.StringIO()
+        argv = [
+            "play_cli.py",
+            "--mode",
+            "human-vs-engine",
+            "--human",
+            "white",
+            "--depth",
+            "1",
+            "--time",
+            "0",
+        ]
+
+        with (
+            mock.patch("sys.argv", argv),
+            mock.patch("builtins.input", side_effect=["q"]),
+            contextlib.redirect_stdout(stdout),
+        ):
+            result = play_cli.main()
+
+        output = stdout.getvalue()
+        self.assertEqual(result, 0)
+        self.assertIn("Black PureSearch thinking...", output)
+        self.assertIn("Black PureSearch chooses", output)
+
+
+class MatchSuiteTests(unittest.TestCase):
+    def test_match_suite_is_reproducible_for_paired_colors(self) -> None:
+        candidate = play_cli.EngineSpec(
+            name="Candidate",
+            model_path=None,
+            ml_mode="auto",
+            device="cpu",
+            depth=1,
+            time_seconds=0.0,
+            learned_weight=0.0,
+            temperature=0.0,
+            symmetry_ensemble=False,
+        )
+        baseline = play_cli.EngineSpec(
+            name="Baseline",
+            model_path=None,
+            ml_mode="auto",
+            device="cpu",
+            depth=1,
+            time_seconds=0.0,
+            learned_weight=0.0,
+            temperature=0.0,
+            symmetry_ensemble=False,
+        )
+        suite = [ml_match_suite.SuitePosition(name="initial", position=Position.initial())]
+
+        first = ml_match_suite.run_match_suite(
+            candidate,
+            baseline,
+            suite_positions=suite,
+            time_controls=(0.0,),
+            max_moves=1,
+        )
+        second = ml_match_suite.run_match_suite(
+            candidate,
+            baseline,
+            suite_positions=suite,
+            time_controls=(0.0,),
+            max_moves=1,
+        )
+
+        self.assertEqual(first, second)
 
 
 if __name__ == "__main__":

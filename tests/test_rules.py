@@ -23,6 +23,90 @@ from ukumog_engine import (
 )
 
 
+RESTRICTED_THREAT_REPRO_ROWS = [
+    "....B......",
+    ".....B.....",
+    "...........",
+    "...B.......",
+    "..B.W.W....",
+    ".....B.....",
+    "....WWB....",
+    "...........",
+    "....W......",
+    "...........",
+    "...........",
+]
+
+RESTRICTED_THREAT_BASE_ROWS = [
+    "....B......",
+    ".....B.....",
+    "...........",
+    "...B.......",
+    "..B.W.W....",
+    "...........",
+    "....WWB....",
+    "...........",
+    "....W......",
+    "...........",
+    "...........",
+]
+
+RESTRICTED_THREAT_DEFENSE = (7, 4)
+RESTRICTED_THREAT_SPECULATIVE = (5, 4)
+RESTRICTED_THREAT_TRANSFORMS = ("identity", "rot90", "rot180", "rot270", "flip_h")
+LARGE_GAP_RESTRICTED_CLAIM_ROWS = [
+    "...........",
+    ".B.........",
+    "...........",
+    ".BB.B......",
+    "...........",
+    ".....W.....",
+    "...........",
+    ".B..B.....B",
+    "...........",
+    "...........",
+    "...........",
+]
+LARGE_GAP_RESTRICTED_CLAIM_MOVE = (5, 9)
+
+
+def _transform_rows(rows: list[str], transform: str) -> list[str]:
+    if transform == "identity":
+        return list(rows)
+    if transform == "rot90":
+        size = len(rows)
+        return ["".join(rows[size - 1 - col][row] for col in range(size)) for row in range(size)]
+    if transform == "rot180":
+        return _transform_rows(_transform_rows(rows, "rot90"), "rot90")
+    if transform == "rot270":
+        return _transform_rows(_transform_rows(rows, "rot180"), "rot90")
+    if transform == "flip_h":
+        return [row[::-1] for row in rows]
+    raise ValueError(f"unknown transform: {transform}")
+
+
+def _transform_coord(coord: tuple[int, int], transform: str, size: int = 11) -> tuple[int, int]:
+    row, col = coord
+    if transform == "identity":
+        return coord
+    if transform == "rot90":
+        return (col, size - 1 - row)
+    if transform == "rot180":
+        return (size - 1 - row, size - 1 - col)
+    if transform == "rot270":
+        return (size - 1 - col, row)
+    if transform == "flip_h":
+        return (row, size - 1 - col)
+    raise ValueError(f"unknown transform: {transform}")
+
+
+def _swap_colors(rows: list[str]) -> list[str]:
+    swapped: list[str] = []
+    for row in rows:
+        swapped.append(row.replace("B", "x").replace("W", "B").replace("x", "W"))
+    return swapped
+
+
 class MaskGenerationTests(unittest.TestCase):
     def test_mask_counts_match_brief(self) -> None:
         self.assertEqual(len(DEFAULT_MASKS.masks4), 780)
@@ -36,6 +120,16 @@ class MaskGenerationTests(unittest.TestCase):
 
 
 class RuleResolutionTests(unittest.TestCase):
+    def test_mask_tables_include_long_step_slopes(self) -> None:
+        steps: set[tuple[int, int]] = set()
+        for pattern in DEFAULT_MASKS.masks5:
+            first = divmod(pattern.cells[0], 11)
+            second = divmod(pattern.cells[1], 11)
+            steps.add((second[0] - first[0], second[1] - first[1]))
+
+        self.assertIn((1, 2), steps)
+        self.assertIn((2, -1), steps)
+
     def test_simple_five_creation_is_a_win(self) -> None:
         rows = [
             "...........",
@@ -133,6 +227,44 @@ class RuleResolutionTests(unittest.TestCase):
         _, result = play_move(position, move)
         self.assertEqual(result, MoveResult.LOSS)
 
+    def test_long_step_positive_slope_is_detected(self) -> None:
+        rows = [
+            "...........",
+            ".B.........",
+            "...B.......",
+            ".....B.....",
+            ".......B...",
+            "...........",
+            "...........",
+            "...........",
+            "...........",
+            "...........",
+            "...........",
+        ]
+        position = Position.from_rows(rows, side_to_move=Color.BLACK)
+        move = coord_to_index(5, 9)
+        _, result = play_move(position, move)
+        self.assertEqual(result, MoveResult.WIN)
+
+    def test_long_step_negative_slope_is_detected(self) -> None:
+        rows = [
+            "...........",
+            "........B..",
+            "...........",
+            ".......B...",
+            "...........",
+            "......B....",
+            "...........",
+            "...........",
+            "...........",
+            "...........",
+            "...........",
+        ]
+        position = Position.from_rows(rows, side_to_move=Color.BLACK)
+        move = coord_to_index(7, 5)
+        _, result = play_move(position, move)
+        self.assertEqual(result, MoveResult.LOSS)
+
     def test_random_play_matches_bruteforce_oracle(self) -> None:
         rng = random.Random(20260419)
         position = Position.initial()
@@ -224,6 +356,40 @@ class SearchTests(unittest.TestCase):
             {coord_to_index(5, 7), coord_to_index(7, 5)},
         )
 
+    def test_tactics_expose_opponent_restricted_pressure_from_poisoned_five(self) -> None:
+        rows = [
+            "...........",
+            "...B.B.B...",
+            "...........",
+            "...B.B.B...",
+            "...........",
+            ".W.......W.",
+            "...........",
+            "...B.B.B...",
+            "...........",
+            "...........",
+            "...........",
+        ]
+        position = Position.from_rows(rows, side_to_move=Color.BLACK)
+        tactics = analyze_tactics(position)
+
+        self.assertFalse(tactics.opponent_winning_moves)
+        self.assertGreater(tactics.opponent_restricted_pressure, 0)
+        self.assertGreater(tactics.opponent_critical_restricted_lines, 0)
+        self.assertTrue(tactics.critical_restricted_responses)
+
+    def test_tactics_expose_large_gap_restricted_claim_and_response(self) -> None:
+        claim_move = coord_to_index(*LARGE_GAP_RESTRICTED_CLAIM_MOVE)
+        attacker_position = Position.from_rows(LARGE_GAP_RESTRICTED_CLAIM_ROWS, side_to_move=Color.WHITE)
+        defender_position = attacker_position.with_side_to_move(Color.BLACK)
+        attacker_tactics = analyze_tactics(attacker_position)
+        defender_tactics = analyze_tactics(defender_position)
+
+        self.assertIn(claim_move, attacker_tactics.critical_restricted_builds)
+        self.assertGreater(attacker_tactics.restricted_pressure, 0)
+        self.assertIn(claim_move, defender_tactics.critical_restricted_responses)
+        self.assertGreater(defender_tactics.opponent_restricted_pressure, 0)
+
     def test_search_finds_immediate_win(self) -> None:
         rows = [
             "...........",
@@ -303,6 +469,39 @@ class SearchTests(unittest.TestCase):
         self.assertEqual(result.best_move, coord_to_index(5, 5))
         self.assertGreater(result.score, 900_000)
 
+    def test_search_blocks_poison_constrained_long_five_threat(self) -> None:
+        rows = [
+            "...........",
+            ".B.........",
+            "...........",
+            "....B......",
+            "...........",
+            ".W...W...W.",
+            "...........",
+            "..........B",
+            "...........",
+            "...........",
+            "...........",
+        ]
+        position = Position.from_rows(rows, side_to_move=Color.BLACK)
+        engine = SearchEngine()
+        result = engine.search(position, max_depth=2, analyze_root=True)
+        defense = coord_to_index(5, 3)
+
+        self.assertIn(defense, analyze_tactics(position).critical_restricted_responses)
+        self.assertEqual(result.best_move, defense)
+
+    def test_search_matches_deeper_large_gap_restricted_claim_motif(self) -> None:
+        position = Position.from_rows(LARGE_GAP_RESTRICTED_CLAIM_ROWS, side_to_move=Color.WHITE)
+        claim_move = coord_to_index(*LARGE_GAP_RESTRICTED_CLAIM_MOVE)
+        deep_engine = SearchEngine()
+        deep = deep_engine.search(position, max_depth=6, analyze_root=True)
+        shallow_engine = SearchEngine()
+        shallow = shallow_engine.search(position, max_depth=3, analyze_root=True)
+
+        self.assertEqual(deep.best_move, claim_move)
+        self.assertEqual(shallow.best_move, claim_move)
+
     def test_iterative_deepening_prefers_center_on_empty_board(self) -> None:
         engine = SearchEngine()
         result = engine.search(Position.initial(), max_depth=3)
@@ -332,6 +531,198 @@ class SearchTests(unittest.TestCase):
         result = engine.search(Position.initial(), max_depth=4)
         self.assertEqual(result.best_move, coord_to_index(5, 5))
         self.assertGreater(result.stats.futility_prunes + result.stats.late_move_prunes, 0)
+
+    def test_exact_short_mate_search_guard_applies_near_root_only(self) -> None:
+        engine = SearchEngine()
+        self.assertTrue(engine._force_exact_short_mate_search(5, 0))
+        self.assertFalse(engine._force_exact_short_mate_search(4, 1))
+        self.assertFalse(engine._force_exact_short_mate_search(3, 2))
+        self.assertFalse(engine._force_exact_short_mate_search(6, 0))
+        self.assertFalse(engine._force_exact_short_mate_search(5, 3))
+
+    def test_search_verifies_restricted_single_safe_threat_across_transforms(self) -> None:
+        boards = {
+            "repro": RESTRICTED_THREAT_REPRO_ROWS,
+            "base": RESTRICTED_THREAT_BASE_ROWS,
+            "repro_swapped": _swap_colors(RESTRICTED_THREAT_REPRO_ROWS),
+            "base_swapped": _swap_colors(RESTRICTED_THREAT_BASE_ROWS),
+        }
+        for board_name, base_rows in boards.items():
+            for transform in RESTRICTED_THREAT_TRANSFORMS:
+                rows = _transform_rows(base_rows, transform)
+                side_to_move = Color.BLACK if board_name.endswith("_swapped") else Color.WHITE
+                position = Position.from_rows(rows, side_to_move=side_to_move)
+                engine = SearchEngine()
+                result = engine.search(position, max_depth=4, analyze_root=True)
+                root_scores = {root_score.move: root_score.score for root_score in result.root_move_scores}
+                defense = coord_to_index(*_transform_coord(RESTRICTED_THREAT_DEFENSE, transform))
+                speculative = coord_to_index(*_transform_coord(RESTRICTED_THREAT_SPECULATIVE, transform))
+
+                with self.subTest(board=board_name, transform=transform):
+                    self.assertIn(defense, root_scores)
+                    self.assertIn(speculative, root_scores)
+                    self.assertGreaterEqual(root_scores[defense], root_scores[speculative])
+                    self.assertGreater(result.stats.single_safe_threat_ordering_hits, 0)
+                    self.assertGreater(result.stats.single_safe_threat_verification_followups, 0)
+
+    def test_single_safe_threat_helper_matches_grandchild_search(self) -> None:
+        boards = {
+            "base": RESTRICTED_THREAT_BASE_ROWS,
+            "base_swapped": _swap_colors(RESTRICTED_THREAT_BASE_ROWS),
+        }
+        for board_name, base_rows in boards.items():
+            for transform in ("identity", "rot90", "flip_h"):
+                rows = _transform_rows(base_rows, transform)
+                side_to_move = Color.BLACK if board_name.endswith("_swapped") else Color.WHITE
+                position = Position.from_rows(rows, side_to_move=side_to_move)
+                move = coord_to_index(*_transform_coord(RESTRICTED_THREAT_SPECULATIVE, transform))
+                forced_reply = coord_to_index(*_transform_coord(RESTRICTED_THREAT_DEFENSE, transform))
+
+                engine = SearchEngine()
+                incremental_state = engine._search_incremental_state(position)
+                snapshot = engine._tactics(position, incremental_state, include_move_maps=False)
+                verified = engine._follow_single_safe_threat_verification(
+                    position,
+                    incremental_state,
+                    snapshot,
+                    move,
+                    depth=4,
+                    alpha=-1_000_000,
+                    beta=1_000_000,
+                    ply=0,
+                    is_pv=True,
+                )
+
+                with self.subTest(board=board_name, transform=transform):
+                    self.assertIsNotNone(verified)
+                    score, line = verified
+                    self.assertEqual(line[:2], (move, forced_reply))
+                    self.assertGreater(engine.stats.single_safe_threat_verification_attempts, 0)
+                    self.assertGreater(engine.stats.single_safe_threat_verification_followups, 0)
+
+                    manual_engine = SearchEngine()
+                    manual_state = manual_engine._search_incremental_state(position)
+                    first_undo = manual_state.make_move(move, position.side_to_move)
+                    try:
+                        child_position = manual_state.to_position()
+                        child_snapshot = manual_engine._tactics(child_position, manual_state, include_move_maps=False)
+                        self.assertEqual(child_snapshot.forced_blocks, (forced_reply,))
+                        second_undo = manual_state.make_move(forced_reply, child_position.side_to_move)
+                        try:
+                            grandchild_position = manual_state.to_position()
+                            manual_score, manual_line = manual_engine._negamax(
+                                grandchild_position,
+                                manual_state,
+                                3,
+                                -1_000_000,
+                                1_000_000,
+                                2,
+                                True,
+                            )
+                        finally:
+                            manual_state.unmake_move(second_undo)
+                    finally:
+                        manual_state.unmake_move(first_undo)
+
+                    self.assertEqual(score, manual_score)
+                    self.assertEqual(line, (move, forced_reply) + manual_line)
+
+    def test_search_matches_deeper_restricted_threat_motif_on_sparse_variants(self) -> None:
+        boards = {
+            "base": RESTRICTED_THREAT_BASE_ROWS,
+            "base_swapped": _swap_colors(RESTRICTED_THREAT_BASE_ROWS),
+        }
+        for board_name, base_rows in boards.items():
+            for transform in RESTRICTED_THREAT_TRANSFORMS:
+                rows = _transform_rows(base_rows, transform)
+                side_to_move = Color.BLACK if board_name.endswith("_swapped") else Color.WHITE
+                position = Position.from_rows(rows, side_to_move=side_to_move)
+                defense = coord_to_index(*_transform_coord(RESTRICTED_THREAT_DEFENSE, transform))
+                speculative = coord_to_index(*_transform_coord(RESTRICTED_THREAT_SPECULATIVE, transform))
+                deep_engine = SearchEngine()
+                deep = deep_engine.search(position, max_depth=6, analyze_root=True)
+                shallow_engine = SearchEngine()
+                shallow = shallow_engine.search(position, max_depth=4, analyze_root=True)
+                shallow_scores = {root_score.move: root_score.score for root_score in shallow.root_move_scores}
+                deep_scores = {root_score.move: root_score.score for root_score in deep.root_move_scores}
+
+                with self.subTest(board=board_name, transform=transform):
+                    self.assertIn(defense, shallow_scores)
+                    self.assertIn(speculative, shallow_scores)
+                    self.assertIn(defense, deep_scores)
+                    self.assertGreaterEqual(shallow_scores[defense], shallow_scores[speculative])
+                    self.assertGreaterEqual(deep_scores[defense], deep_scores.get(speculative, -1_000_000))
+                    self.assertGreater(shallow.stats.single_safe_threat_verification_followups, 0)
+
+    def test_rank_moves_respects_tt_move_priority(self) -> None:
+        history = [41, 19, 52, 86, 6, 10, 111, 73, 14, 51, 82, 8, 72, 32, 4, 16, 66, 64]
+        position = self._position_from_history(history)
+        engine = SearchEngine()
+        incremental_state = engine._search_incremental_state(position)
+        snapshot = engine._tactics(position, incremental_state, include_move_maps=False)
+        quiet_moves = [move for move in snapshot.safe_moves if engine._is_quiet_move(snapshot, move)]
+
+        self.assertGreaterEqual(len(quiet_moves), 2)
+        tt_move = quiet_moves[-1]
+        ranked = engine._rank_moves(
+            position,
+            incremental_state,
+            snapshot,
+            quiet_moves[:],
+            0,
+            tt_move,
+            True,
+        )
+
+        self.assertEqual(ranked[0], tt_move)
+
+    def test_record_cutoff_updates_history_and_killers_for_quiet_move(self) -> None:
+        history = [41, 19, 52, 86, 6, 10, 111, 73, 14, 51, 82, 8, 72, 32, 4, 16, 66, 64]
+        position = self._position_from_history(history)
+        engine = SearchEngine()
+        incremental_state = engine._search_incremental_state(position)
+        snapshot = engine._tactics(position, incremental_state, include_move_maps=False)
+        quiet_move = next(move for move in snapshot.safe_moves if engine._is_quiet_move(snapshot, move))
+        side_index = 0 if position.side_to_move is Color.BLACK else 1
+
+        engine._record_cutoff(
+            position,
+            snapshot,
+            quiet_move,
+            depth=3,
+            ply=1,
+        )
+
+        self.assertGreater(engine.history[side_index][quiet_move], 0)
+        self.assertEqual(engine.killers[1][0], quiet_move)
+        self.assertGreater(engine.stats.history_updates, 0)
+        self.assertGreater(engine.stats.killer_updates, 0)
+
+    def test_record_cutoff_applies_history_malus_to_prior_quiet_moves(self) -> None:
+        history = [41, 19, 52, 86, 6, 10, 111, 73, 14, 51, 82, 8, 72, 32, 4, 16, 66, 64]
+        position = self._position_from_history(history)
+        engine = SearchEngine()
+        incremental_state = engine._search_incremental_state(position)
+        snapshot = engine._tactics(position, incremental_state, include_move_maps=False)
+        quiet_moves = [move for move in snapshot.safe_moves if engine._is_quiet_move(snapshot, move)]
+
+        self.assertGreaterEqual(len(quiet_moves), 2)
+        prior_quiet_move = quiet_moves[0]
+        cutoff_quiet_move = quiet_moves[1]
+        side_index = 0 if position.side_to_move is Color.BLACK else 1
+
+        engine._record_cutoff(
+            position,
+            snapshot,
+            cutoff_quiet_move,
+            depth=4,
+            ply=1,
+            prior_quiet_moves=[prior_quiet_move],
+        )
+
+        self.assertLess(engine.history[side_index][prior_quiet_move], 0)
+        self.assertGreater(engine.history[side_index][cutoff_quiet_move], 0)
+        self.assertGreater(engine.stats.history_malus_updates, 0)
 
     def test_search_make_unmake_does_not_mutate_root_position(self) -> None:
         position = self._position_from_history([41, 19, 52, 86, 6, 10, 111, 73])
@@ -373,6 +764,75 @@ class SearchTests(unittest.TestCase):
 
         self.assertEqual(first, second)
         self.assertGreater(engine.stats.qtt_hits, hits_before)
+
+    def test_quiescence_fast_paths_single_forced_block_chain(self) -> None:
+        position = Position.from_rows(
+            [
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "W.W.W.W....",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+            ],
+            side_to_move=Color.BLACK,
+        )
+        engine = SearchEngine()
+        incremental_state = engine._search_incremental_state(position)
+        snapshot = engine._tactics(position, incremental_state, include_move_maps=False)
+        score, line = engine._follow_single_forced_block_quiescence(
+            position,
+            incremental_state,
+            snapshot,
+            -1_000_000,
+            1_000_000,
+            -1_000_000,
+            1_000_000,
+            0,
+            2,
+            False,
+            (position.black_bits, position.white_bits, 0),
+        )
+
+        self.assertIsInstance(line, tuple)
+        self.assertGreater(engine.stats.quiescence_single_forced_block_nodes, 0)
+        self.assertLess(score, 1_000_000)
+
+    def test_quiescence_skips_nonpv_frontier_single_safe_threat(self) -> None:
+        position = Position.from_rows(
+            [
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "B.B...B....",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+            ],
+            side_to_move=Color.BLACK,
+        )
+        engine = SearchEngine()
+        incremental_state = engine._search_incremental_state(position)
+        snapshot = engine._tactics(position, incremental_state, include_move_maps=False)
+
+        self.assertTrue(snapshot.safe_threats)
+        self.assertEqual(engine._quiescence_skip_reason(snapshot, 0, 1, False), "frontier_safe_threat")
+        self.assertTrue(engine._should_skip_soft_quiescence(snapshot, 0, 1, False))
+        self.assertFalse(engine._should_skip_soft_quiescence(snapshot, 0, 1, True))
+        self.assertEqual(engine._quiescence_safe_threat_limit(snapshot, 0, 1, False), 1)
+        self.assertEqual(
+            engine._quiescence_safe_threat_limit(snapshot, -1, engine.tactical_depth, True),
+            3,
+        )
 
 
 class TacticalSolverTests(unittest.TestCase):
@@ -434,8 +894,9 @@ class BenchmarkToolTests(unittest.TestCase):
             text=True,
         )
         lines = [line for line in completed.stdout.splitlines() if line.strip()]
-        self.assertGreaterEqual(len(lines), 4)
+        self.assertGreaterEqual(len(lines), 5)
         self.assertTrue(any("name=initial" in line for line in lines))
+        self.assertTrue(any("name=restricted_threat_midgame" in line for line in lines))
         expected_fields = (
             "depth=",
             "elapsed_s=",
@@ -444,6 +905,11 @@ class BenchmarkToolTests(unittest.TestCase):
             "quiescence_s=",
             "proof_s=",
             "qtt_hits=",
+            "qforced_single=",
+            "qsafe_only=",
+            "qsafe_pruned=",
+            "qskip_frontier=",
+            "qskip_wide=",
             "futility_prunes=",
             "late_move_prunes=",
         )

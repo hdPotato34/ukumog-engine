@@ -15,10 +15,13 @@ from .mask_features import encode_mask_states
 from .model import (
     MODEL_KIND_LEGACY_POLICY_VALUE,
     MODEL_KIND_MASK_VALUE_V1,
+    MODEL_KIND_ROOT_POLICY_V1,
     LegacyModelConfig,
     ModelConfig,
+    RootPolicyModelConfig,
     UkumogMaskValueNet,
     UkumogPolicyValueNet,
+    UkumogRootPolicyNet,
 )
 from .symmetry import inverse_symmetry, transform_flat_mask, transform_planes
 
@@ -26,6 +29,19 @@ from .symmetry import inverse_symmetry, transform_flat_mask, transform_planes
 def _position_key(position: Position) -> tuple[int, int, int]:
     side_flag = 0 if position.side_to_move is Color.BLACK else 1
     return position.black_bits, position.white_bits, side_flag
+
+
+def _resolve_device(device: str | torch.device | None) -> torch.device:
+    if isinstance(device, torch.device):
+        resolved = device
+    else:
+        device_name = "auto" if device is None else str(device)
+        if device_name == "auto":
+            device_name = "cuda" if torch.cuda.is_available() else "cpu"
+        if device_name == "cuda" and not torch.cuda.is_available():
+            device_name = "cpu"
+        resolved = torch.device(device_name)
+    return resolved
 
 
 def _upgrade_legacy_state_dict(model_state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -85,7 +101,7 @@ class TorchPolicyValueEvaluator:
         policy_bonus_scale: int = 18_000,
         symmetry_ensemble: bool = False,
     ) -> None:
-        resolved_device = torch.device(device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu"))
+        resolved_device = _resolve_device(device)
         self.model = model.to(resolved_device)
         self.model.eval()
         self.model_kind = model_kind
@@ -96,6 +112,7 @@ class TorchPolicyValueEvaluator:
         self.symmetry_ensemble = symmetry_ensemble
         self.supports_policy = model_kind != MODEL_KIND_MASK_VALUE_V1
         self.quiet_value_only = model_kind == MODEL_KIND_MASK_VALUE_V1
+        self.default_ml_mode = "quiet-value" if self.quiet_value_only else "root-policy"
         self.cache: dict[tuple[int, int, int], tuple[np.ndarray | None, float]] = {}
 
     @classmethod
@@ -123,6 +140,20 @@ class TorchPolicyValueEvaluator:
                 value_scale=value_scale,
                 policy_bonus_scale=policy_bonus_scale,
                 symmetry_ensemble=False,
+            )
+
+        if model_kind == MODEL_KIND_ROOT_POLICY_V1:
+            config = RootPolicyModelConfig(**checkpoint["model_config"])
+            model = UkumogRootPolicyNet(config)
+            model.load_state_dict(checkpoint["model_state"])
+            return cls(
+                model=model,
+                model_kind=model_kind,
+                device=device,
+                tables=tables,
+                value_scale=value_scale,
+                policy_bonus_scale=policy_bonus_scale,
+                symmetry_ensemble=symmetry_ensemble,
             )
 
         upgraded_state = _upgrade_legacy_state_dict(checkpoint["model_state"])
@@ -202,6 +233,35 @@ class TorchPolicyValueEvaluator:
             return result
 
         features = encode_position(position, self.tables, snapshot, opponent_snapshot)
+        if self.model_kind == MODEL_KIND_ROOT_POLICY_V1:
+            if not self.symmetry_ensemble:
+                batch = torch.from_numpy(features).unsqueeze(0).to(self.device)
+                with torch.no_grad():
+                    policy_logits = self.model(batch)
+                result = (
+                    policy_logits.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False),
+                    0.0,
+                )
+                self.cache[key] = result
+                return result
+
+            policy_accum = np.zeros((121,), dtype=np.float32)
+            for symmetry in range(8):
+                sym_features = transform_planes(features, symmetry)
+                batch = torch.from_numpy(sym_features).unsqueeze(0).to(self.device)
+                with torch.no_grad():
+                    policy_logits = self.model(batch)
+                sym_policy = policy_logits.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
+                restored_policy = transform_flat_mask(sym_policy, inverse_symmetry(symmetry)).astype(
+                    np.float32,
+                    copy=False,
+                )
+                policy_accum += restored_policy
+
+            result = (policy_accum / 8.0, 0.0)
+            self.cache[key] = result
+            return result
+
         if not self.symmetry_ensemble:
             batch = torch.from_numpy(features).unsqueeze(0).to(self.device)
             with torch.no_grad():

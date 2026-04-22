@@ -1,59 +1,25 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
-import json
-from pathlib import Path
-import math
 import random
+from pathlib import Path
 
-from ukumog_engine import Color, MoveResult, Position, SearchEngine, coord_to_index, index_to_coord, play_move
-from ukumog_engine.ml import TorchPolicyValueEvaluator
-
-
-STONE_BY_COLOR = {
-    Color.BLACK: "B",
-    Color.WHITE: "W",
-}
-
-
-@dataclass(slots=True)
-class EngineController:
-    label: str
-    depth: int
-    time_seconds: float
-    learned_weight: float
-    model_path: Path | None
-    ml_mode: str
-    temperature: float
-    symmetry_ensemble: bool
-    engine: SearchEngine
-    searches_run: int = 0
-    total_search_seconds: float = 0.0
-    total_model_seconds: float = 0.0
-    total_nodes: int = 0
-    total_qnodes: int = 0
-    total_tactics_seconds: float = 0.0
-    total_eval_seconds: float = 0.0
-    total_ordering_seconds: float = 0.0
-    total_quiescence_seconds: float = 0.0
-    total_proof_seconds: float = 0.0
-
-    @property
-    def time_ms(self) -> int | None:
-        return None if self.time_seconds <= 0 else int(self.time_seconds * 1000)
-
-
-@dataclass(frozen=True, slots=True)
-class EngineSpec:
-    name: str
-    model_path: Path | None
-    ml_mode: str
-    depth: int
-    time_seconds: float
-    learned_weight: float
-    temperature: float
-    symmetry_ensemble: bool
+from ukumog_engine import Color, MoveResult, Position, coord_to_index, index_to_coord, play_move
+from ukumog_engine.app_runtime import (
+    EngineController,
+    EngineSpec,
+    announce_result as runtime_announce_result,
+    append_stats_record as runtime_append_stats_record,
+    build_engine_controller as runtime_build_engine_controller,
+    choose_engine_move as runtime_choose_engine_move,
+    controller_from_spec as runtime_controller_from_spec,
+    describe_engine as runtime_describe_engine,
+    describe_spec as runtime_describe_spec,
+    engine_settings_for_color as runtime_engine_settings_for_color,
+    engine_spec_for_color as runtime_engine_spec_for_color,
+    format_time_trace as runtime_format_time_trace,
+    record_search_totals as runtime_record_search_totals,
+)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -86,19 +52,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--model",
         type=Path,
         default=None,
-        help="Optional checkpoint produced by `python -m ukumog_engine.ml.train`.",
+        help="Optional ML checkpoint for root-policy or quiet-value inference.",
     )
     parser.add_argument(
         "--ml-mode",
-        choices=("quiet-value", "full", "policy-only", "root-policy", "root-hybrid"),
-        default="quiet-value",
-        help="How the learned model is used inside search. Default: quiet-value.",
+        choices=("auto", "quiet-value", "full", "policy-only", "root-policy", "root-hybrid"),
+        default="auto",
+        help="How the learned model is used inside search. Default: auto.",
     )
     parser.add_argument(
         "--learned-weight",
         type=float,
-        default=0.25,
-        help="How strongly to blend the learned evaluator into static evaluation. Default: 0.25.",
+        default=0.10,
+        help="How strongly to blend the learned evaluator into static evaluation. Default: 0.10.",
+    )
+    parser.add_argument(
+        "--device",
+        choices=("cpu", "cuda", "auto"),
+        default="cpu",
+        help="Inference device for learned checkpoints. Default: cpu.",
     )
     parser.add_argument(
         "--symmetry-ensemble",
@@ -125,13 +97,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--black-ml-mode",
-        choices=("quiet-value", "full", "policy-only", "root-policy", "root-hybrid"),
+        choices=("auto", "quiet-value", "full", "policy-only", "root-policy", "root-hybrid"),
         default=None,
         help="Black engine ML integration mode override.",
     )
     parser.add_argument(
         "--white-ml-mode",
-        choices=("quiet-value", "full", "policy-only", "root-policy", "root-hybrid"),
+        choices=("auto", "quiet-value", "full", "policy-only", "root-policy", "root-hybrid"),
         default=None,
         help="White engine ML integration mode override.",
     )
@@ -256,226 +228,15 @@ def parse_human_move(raw: str) -> tuple[int, int] | None:
     return row, col
 
 
-def announce_result(actor: str, color: Color, move: int, result: MoveResult) -> str:
-    row, col = index_to_coord(move)
-    stone = STONE_BY_COLOR[color]
-    if result is MoveResult.WIN:
-        return f"{actor} played {stone} at ({row}, {col}) and wins immediately."
-    if result is MoveResult.LOSS:
-        return f"{actor} played {stone} at ({row}, {col}) and loses immediately."
-    return f"{actor} played {stone} at ({row}, {col})."
-
-
-def _build_engine_controller(
-    color: Color,
-    model_path: Path | None,
-    ml_mode: str,
-    depth: int,
-    time_seconds: float,
-    learned_weight: float,
-    temperature: float,
-    symmetry_ensemble: bool,
-    label: str | None = None,
-) -> EngineController:
-    learned_evaluator = (
-        TorchPolicyValueEvaluator.from_checkpoint(
-            model_path,
-            device="cpu",
-            symmetry_ensemble=symmetry_ensemble,
-        )
-        if model_path is not None
-        else None
-    )
-    if label is None:
-        if model_path is None:
-            label = f"{color.name.title()} PureSearch"
-        else:
-            label = f"{color.name.title()} ML"
-
-    if ml_mode == "quiet-value":
-        learned_policy_max_ply = -1
-        learned_value_max_ply = None
-        effective_weight = learned_weight
-    elif ml_mode == "full":
-        learned_policy_max_ply = None
-        learned_value_max_ply = None
-        effective_weight = learned_weight
-    elif ml_mode == "policy-only":
-        learned_policy_max_ply = None
-        learned_value_max_ply = -1
-        effective_weight = 0.0
-    elif ml_mode == "root-hybrid":
-        learned_policy_max_ply = 0
-        learned_value_max_ply = 0
-        effective_weight = learned_weight
-    else:
-        learned_policy_max_ply = 0
-        learned_value_max_ply = -1
-        effective_weight = 0.0
-
-    return EngineController(
-        label=label,
-        depth=depth,
-        time_seconds=time_seconds,
-        learned_weight=effective_weight,
-        model_path=model_path,
-        ml_mode=ml_mode,
-        temperature=temperature,
-        symmetry_ensemble=symmetry_ensemble,
-        engine=SearchEngine(
-            learned_evaluator=learned_evaluator,
-            learned_eval_weight=effective_weight,
-            learned_policy_max_ply=learned_policy_max_ply,
-            learned_value_max_ply=learned_value_max_ply,
-        ),
-    )
-
-
-def _engine_settings_for_color(
-    args: argparse.Namespace,
-    color: Color,
-) -> tuple[Path | None, str, int, float, float, float, bool]:
-    prefix = "black" if color is Color.BLACK else "white"
-    model_path = getattr(args, f"{prefix}_model") or args.model
-    ml_mode = getattr(args, f"{prefix}_ml_mode") or args.ml_mode
-    depth = getattr(args, f"{prefix}_depth") or args.depth
-    time_seconds = getattr(args, f"{prefix}_time")
-    if time_seconds is None:
-        time_seconds = args.time
-    learned_weight = getattr(args, f"{prefix}_learned_weight")
-    if learned_weight is None:
-        learned_weight = args.learned_weight
-    temperature = getattr(args, f"{prefix}_temperature")
-    if temperature is None:
-        temperature = args.temperature
-    symmetry_ensemble = getattr(args, f"{prefix}_symmetry_ensemble") or args.symmetry_ensemble
-    return model_path, ml_mode, depth, time_seconds, learned_weight, temperature, symmetry_ensemble
-
-
-def _engine_spec_for_color(
-    args: argparse.Namespace,
-    color: Color,
-    name: str,
-) -> EngineSpec:
-    model_path, ml_mode, depth, time_seconds, learned_weight, temperature, symmetry_ensemble = _engine_settings_for_color(
-        args,
-        color,
-    )
-    return EngineSpec(
-        name=name,
-        model_path=model_path,
-        ml_mode=ml_mode,
-        depth=depth,
-        time_seconds=time_seconds,
-        learned_weight=learned_weight,
-        temperature=temperature,
-        symmetry_ensemble=symmetry_ensemble,
-    )
-
-
-def _describe_engine(controller: EngineController) -> str:
-    time_text = "unlimited" if controller.time_ms is None else f"{controller.time_seconds:g}s"
-    if controller.model_path is None:
-        model_text = "pure search"
-    else:
-        model_text = f"model={controller.model_path}"
-    return (
-        f"{controller.label}: depth={controller.depth}, time={time_text}, "
-        f"ml_mode={controller.ml_mode}, learned_weight={controller.learned_weight:g}, "
-        f"temperature={controller.temperature:g}, "
-        f"symmetry_ensemble={controller.symmetry_ensemble}, {model_text}"
-    )
-
-
-def _describe_spec(spec: EngineSpec) -> str:
-    time_text = "unlimited" if spec.time_seconds <= 0 else f"{spec.time_seconds:g}s"
-    if spec.model_path is None:
-        model_text = "pure search"
-    else:
-        model_text = f"model={spec.model_path}"
-    return (
-        f"{spec.name}: depth={spec.depth}, time={time_text}, "
-        f"ml_mode={spec.ml_mode}, learned_weight={spec.learned_weight:g}, "
-        f"temperature={spec.temperature:g}, "
-        f"symmetry_ensemble={spec.symmetry_ensemble}, {model_text}"
-    )
-
-
-def _sample_root_move(
-    preferred_move: int | None,
-    ordered_moves: list[int],
-    temperature: float,
-    sample_top_k: int,
-    rng: random.Random,
-) -> int | None:
-    if preferred_move is None:
-        return None
-    if temperature <= 0 or len(ordered_moves) <= 1:
-        return preferred_move
-
-    shortlist: list[int] = [preferred_move]
-    for move in ordered_moves:
-        if move != preferred_move:
-            shortlist.append(move)
-        if len(shortlist) >= max(1, sample_top_k):
-            break
-
-    if len(shortlist) == 1:
-        return preferred_move
-
-    weights = [math.exp(-(index / temperature)) for index in range(len(shortlist))]
-    return rng.choices(shortlist, weights=weights, k=1)[0]
-
-
-def _append_stats_record(path: Path, record: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, sort_keys=True) + "\n")
-
-
-def _record_search_totals(controller: EngineController, search_result: object) -> None:
-    controller.searches_run += 1
-    controller.total_search_seconds += search_result.stats.elapsed_seconds
-    controller.total_model_seconds += search_result.stats.model_time_seconds
-    controller.total_nodes += search_result.stats.nodes
-    controller.total_qnodes += search_result.stats.quiescence_nodes
-    controller.total_tactics_seconds += search_result.stats.tactics_time_seconds
-    controller.total_eval_seconds += search_result.stats.eval_time_seconds
-    controller.total_ordering_seconds += search_result.stats.ordering_time_seconds
-    controller.total_quiescence_seconds += search_result.stats.quiescence_time_seconds
-    controller.total_proof_seconds += search_result.stats.proof_solver_time_seconds
-
-
-def _format_time_trace(controller: EngineController, search_result: object) -> str:
-    stats = search_result.stats
-    cumulative_share = 0.0
-    if controller.total_search_seconds > 0.0:
-        cumulative_share = controller.total_model_seconds / controller.total_search_seconds
-    return "\n".join(
-        [
-            (
-                "time "
-                f"search={stats.elapsed_seconds:.3f}s "
-                f"model={stats.model_time_seconds:.3f}s "
-                f"share={stats.model_time_fraction:.1%} "
-                f"nodes={stats.nodes} "
-                f"qnodes={stats.quiescence_nodes} "
-                f"nps={stats.nodes_per_second:.0f} "
-                f"qnps={stats.qnodes_per_second:.0f} "
-                f"cum_search={controller.total_search_seconds:.3f}s "
-                f"cum_model={controller.total_model_seconds:.3f}s "
-                f"cum_share={cumulative_share:.1%}"
-            ),
-            (
-                "breakdown "
-                f"tactics={stats.tactics_time_seconds:.3f}s "
-                f"eval={stats.eval_time_seconds:.3f}s "
-                f"ordering={stats.ordering_time_seconds:.3f}s "
-                f"quiescence={stats.quiescence_time_seconds:.3f}s "
-                f"proof={stats.proof_solver_time_seconds:.3f}s"
-            ),
-        ]
-    )
+announce_result = runtime_announce_result
+_build_engine_controller = runtime_build_engine_controller
+_engine_settings_for_color = runtime_engine_settings_for_color
+_engine_spec_for_color = runtime_engine_spec_for_color
+_describe_engine = runtime_describe_engine
+_describe_spec = runtime_describe_spec
+_append_stats_record = runtime_append_stats_record
+_record_search_totals = runtime_record_search_totals
+_format_time_trace = runtime_format_time_trace
 
 
 def _print_match_time_totals(controllers: dict[Color, EngineController]) -> None:
@@ -512,52 +273,8 @@ def _print_match_time_totals(controllers: dict[Color, EngineController]) -> None
         )
 
 
-def _choose_engine_move(
-    position: Position,
-    controller: EngineController,
-    plies_played: int,
-    temperature_plies: int,
-    sample_top_k: int,
-    rng: random.Random,
-) -> tuple[int | None, object, bool]:
-    result = controller.engine.search(position, max_depth=controller.depth, max_time_ms=controller.time_ms)
-    sampled = False
-    move = result.best_move
-    if (
-        controller.temperature > 0
-        and plies_played < temperature_plies
-        and result.best_move is not None
-    ):
-        incremental_state = controller.engine._search_incremental_state(position)
-        snapshot = controller.engine._tactics(position, incremental_state)
-        ordered_moves = controller.engine._ordered_search_moves(
-            position,
-            incremental_state,
-            snapshot,
-            controller.depth,
-            0,
-            None,
-            True,
-        )
-        sampled_move = _sample_root_move(result.best_move, ordered_moves, controller.temperature, sample_top_k, rng)
-        if sampled_move is not None:
-            sampled = sampled_move != result.best_move
-            move = sampled_move
-    return move, result, sampled
-
-
-def _controller_from_spec(color: Color, spec: EngineSpec) -> EngineController:
-    return _build_engine_controller(
-        color=color,
-        model_path=spec.model_path,
-        ml_mode=spec.ml_mode,
-        depth=spec.depth,
-        time_seconds=spec.time_seconds,
-        learned_weight=spec.learned_weight,
-        temperature=spec.temperature,
-        symmetry_ensemble=spec.symmetry_ensemble,
-        label=f"{spec.name} ({color.name.title()})",
-    )
+_choose_engine_move = runtime_choose_engine_move
+_controller_from_spec = runtime_controller_from_spec
 
 
 def _play_engine_vs_engine_game(
@@ -568,8 +285,9 @@ def _play_engine_vs_engine_game(
     *,
     game_index: int = 0,
     verbose: bool = True,
+    start_position: Position | None = None,
 ) -> dict[str, object]:
-    position = Position.initial()
+    position = Position.initial() if start_position is None else start_position
     controllers = {
         Color.BLACK: _controller_from_spec(Color.BLACK, black_spec),
         Color.WHITE: _controller_from_spec(Color.WHITE, white_spec),
@@ -840,19 +558,20 @@ def main() -> int:
     if args.mode == "human-vs-engine":
         human_color = Color.BLACK if args.human == "black" else Color.WHITE
         engine_color = human_color.opponent
-        model_path, ml_mode, depth, time_seconds, learned_weight, temperature, symmetry_ensemble = _engine_settings_for_color(
+        model_path, ml_mode, device, depth, time_seconds, learned_weight, temperature, symmetry_ensemble = _engine_settings_for_color(
             args,
             engine_color,
         )
         engine_controller = _build_engine_controller(
-            engine_color,
-            model_path,
-            ml_mode,
-            depth,
-            time_seconds,
-            learned_weight,
-            temperature,
-            symmetry_ensemble,
+            color=engine_color,
+            model_path=model_path,
+            ml_mode=ml_mode,
+            depth=depth,
+            time_seconds=time_seconds,
+            learned_weight=learned_weight,
+            device=device,
+            temperature=temperature,
+            symmetry_ensemble=symmetry_ensemble,
         )
         time_text = "unlimited" if engine_controller.time_ms is None else f"{engine_controller.time_seconds:g}s"
         print(

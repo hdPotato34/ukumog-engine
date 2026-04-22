@@ -9,6 +9,7 @@ from ..search import MATE_SCORE
 from .data import (
     DATASET_KIND_LEGACY_POLICY_VALUE,
     DATASET_KIND_QUIET_VALUE_V1,
+    DATASET_KIND_ROOT_POLICY_V1,
     load_dataset_kind,
 )
 
@@ -36,8 +37,11 @@ def inspect_dataset(path: str | Path) -> dict[str, object]:
             quiet_ratio = 1.0 - tactical_ratio
 
         mate_like_ratio = 0.0
-        if "scores" in data.files and sample_count:
-            scores = np.asarray(data["scores"])
+        score_key = "scores"
+        if dataset_kind == DATASET_KIND_ROOT_POLICY_V1 and "best_scores" in data.files:
+            score_key = "best_scores"
+        if score_key in data.files and sample_count:
+            scores = np.asarray(data[score_key])
             mate_like_ratio = float((np.abs(scores) >= (MATE_SCORE - 1_000)).mean())
 
         search_depth_counts: dict[int, int] = {}

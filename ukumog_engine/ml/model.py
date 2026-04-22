@@ -17,6 +17,7 @@ from .mask_features import (
 
 MODEL_KIND_MASK_VALUE_V1 = "mask_value_v1"
 MODEL_KIND_LEGACY_POLICY_VALUE = "legacy_policy_value_v0"
+MODEL_KIND_ROOT_POLICY_V1 = "root_policy_v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +66,20 @@ def _group_count(max_groups: int, channels: int) -> int:
 
 
 @dataclass(frozen=True, slots=True)
+class RootPolicyModelConfig:
+    input_channels: int = FEATURE_CHANNELS
+    trunk_channels: int = 56
+    residual_blocks: int = 5
+    policy_channels: int = 24
+    norm_groups: int = 8
+    trunk_dropout: float = 0.03
+    head_dropout: float = 0.10
+
+    def to_dict(self) -> dict[str, int | float]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
 class LegacyModelConfig:
     input_channels: int = FEATURE_CHANNELS
     trunk_channels: int = 56
@@ -97,6 +112,43 @@ class ResidualBlock(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return self.activation(x + self.block(x))
+
+
+class UkumogRootPolicyNet(nn.Module):
+    def __init__(self, config: RootPolicyModelConfig | None = None) -> None:
+        super().__init__()
+        self.config = config if config is not None else RootPolicyModelConfig()
+        trunk_groups = _group_count(self.config.norm_groups, self.config.trunk_channels)
+        policy_groups = _group_count(self.config.norm_groups, self.config.policy_channels)
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(self.config.input_channels, self.config.trunk_channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(trunk_groups, self.config.trunk_channels),
+            nn.SiLU(),
+            nn.Dropout2d(self.config.trunk_dropout) if self.config.trunk_dropout > 0.0 else nn.Identity(),
+        )
+        self.trunk = nn.Sequential(
+            *[
+                ResidualBlock(
+                    self.config.trunk_channels,
+                    self.config.norm_groups,
+                    self.config.trunk_dropout,
+                )
+                for _ in range(self.config.residual_blocks)
+            ]
+        )
+        self.policy_head = nn.Sequential(
+            nn.Conv2d(self.config.trunk_channels, self.config.policy_channels, kernel_size=1, bias=False),
+            nn.GroupNorm(policy_groups, self.config.policy_channels),
+            nn.SiLU(),
+            nn.Dropout2d(self.config.head_dropout) if self.config.head_dropout > 0.0 else nn.Identity(),
+            nn.Flatten(),
+            nn.Linear(self.config.policy_channels * 11 * 11, BOARD_CELLS),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        trunk = self.trunk(self.stem(x))
+        return self.policy_head(trunk)
 
 
 class UkumogPolicyValueNet(nn.Module):
