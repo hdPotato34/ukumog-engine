@@ -1964,7 +1964,15 @@ class SearchEngine:
                 None,
                 use_ordering_maps=False,
             )
-            ranked_quiet = self._rank_moves(position, incremental_state, snapshot, quiet_moves, 0, None, True)
+            ranked_quiet = self._rank_moves(
+                position,
+                incremental_state,
+                snapshot,
+                quiet_moves,
+                0,
+                None,
+                True,
+            )
             quiet_limit = self._quiet_move_limit(position, snapshot, 1, 0)
             moves = ranked_priority + ranked_quiet[:quiet_limit]
         else:
@@ -1997,7 +2005,6 @@ class SearchEngine:
             limit = min(limit, TACTICAL_QUIET_TAIL)
 
         return max(TACTICAL_QUIET_TAIL, limit)
-
     def _allow_quiet_frontier_pruning(
         self,
         snapshot: TacticalSnapshot,
@@ -2209,17 +2216,49 @@ class SearchEngine:
                         critical_restricted_responses=white_summary.critical_restricted_responses,
                     )
                 else:
-                    black_position = position.with_side_to_move(Color.BLACK)
-                    white_position = position.with_side_to_move(Color.WHITE)
-                    black_snapshot = analyze_tactics(
-                        black_position,
-                        self.tables,
-                        include_move_maps=resolved_detail is TacticalDetail.ORDERING,
+                    derived_state = IncrementalState.from_position(position, self.tables)
+                    ordered_candidates = derived_state.ordered_candidate_moves()
+                    black_summary, white_summary = derived_state.paired_tactical_summaries(
+                        ordered_candidates,
+                        detail=resolved_detail,
                     )
-                    white_snapshot = analyze_tactics(
-                        white_position,
-                        self.tables,
-                        include_move_maps=resolved_detail is TacticalDetail.ORDERING,
+                    black_snapshot = TacticalSnapshot(
+                        candidate_moves=black_summary.candidate_moves,
+                        safe_moves=black_summary.safe_moves,
+                        winning_moves=black_summary.winning_moves,
+                        poison_moves=black_summary.poison_moves,
+                        forced_blocks=black_summary.forced_blocks,
+                        safe_threats=black_summary.safe_threats,
+                        double_threats=black_summary.double_threats,
+                        opponent_winning_moves=black_summary.opponent_winning_moves,
+                        future_wins_by_move=black_summary.future_wins_by_move,
+                        opponent_wins_after_move=black_summary.opponent_wins_after_move,
+                        restricted_pressure=black_summary.restricted_pressure,
+                        opponent_restricted_pressure=black_summary.opponent_restricted_pressure,
+                        critical_restricted_lines=black_summary.critical_restricted_lines,
+                        opponent_critical_restricted_lines=black_summary.opponent_critical_restricted_lines,
+                        restricted_move_pressure=black_summary.restricted_move_pressure,
+                        critical_restricted_builds=black_summary.critical_restricted_builds,
+                        critical_restricted_responses=black_summary.critical_restricted_responses,
+                    )
+                    white_snapshot = TacticalSnapshot(
+                        candidate_moves=white_summary.candidate_moves,
+                        safe_moves=white_summary.safe_moves,
+                        winning_moves=white_summary.winning_moves,
+                        poison_moves=white_summary.poison_moves,
+                        forced_blocks=white_summary.forced_blocks,
+                        safe_threats=white_summary.safe_threats,
+                        double_threats=white_summary.double_threats,
+                        opponent_winning_moves=white_summary.opponent_winning_moves,
+                        future_wins_by_move=white_summary.future_wins_by_move,
+                        opponent_wins_after_move=white_summary.opponent_wins_after_move,
+                        restricted_pressure=white_summary.restricted_pressure,
+                        opponent_restricted_pressure=white_summary.opponent_restricted_pressure,
+                        critical_restricted_lines=white_summary.critical_restricted_lines,
+                        opponent_critical_restricted_lines=white_summary.opponent_critical_restricted_lines,
+                        restricted_move_pressure=white_summary.restricted_move_pressure,
+                        critical_restricted_builds=white_summary.critical_restricted_builds,
+                        critical_restricted_responses=white_summary.critical_restricted_responses,
                     )
                 self.stats.tactics_time_seconds += time.perf_counter() - started_at
                 self.tactics_pair_cache[(*occupancy_key, cache_flag)] = (black_snapshot, white_snapshot)

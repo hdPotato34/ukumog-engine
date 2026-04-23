@@ -4,6 +4,48 @@ Active search-engine roadmap and measurement log for the current repo state.
 
 Historical context lives in [README_HISTORY_20260421.md](archive/README_HISTORY_20260421.md). That archive is still worth keeping around because it records how Stages 1-5 were reached, but this file is the active search-specific planning document going forward.
 
+## Latest Update: 2026-04-23 Speed Recovery Pass
+
+The recent poisoned-line strength pass was real, but it also made the engine materially slower in practice. The user-facing symptom was simple: searches that had been taking only a few seconds at depth 7 were now landing closer to `12s` per move on the same machine.
+
+Depth-6 profiling showed that the slowdown was mostly tactical-kernel overhead, not a broad alpha-beta regression:
+
+* `paired_tactical_summaries` became the dominant hot path again
+* the old restricted-line helper path was spending millions of calls on masks that could never contribute
+* full-board winning-mask and poison-mask scans were being repeated even though the earlier candidate pass had already walked the same data
+* the `search._tactics` fallback was rebuilding incremental state more than necessary when it had to derive both sides' snapshots outside the main search path
+
+Changes landed in this recovery pass:
+
+* merged candidate and full-board winning-mask derivation into one shared `_paired_winning_move_data` pass
+* merged candidate poison-set collection and full poison-bit derivation into one shared `_paired_poison_move_data` pass
+* inlined restricted-line evaluation behind cheap guards so we only pay for masks that both contain poison and have a relevant attacker count
+* replaced set-heavy restricted critical-build / response accumulation with board-bit masks
+* removed the extra incremental rebuild in the `search._tactics` fallback by deriving paired tactical summaries from one temporary `IncrementalState`
+* restored the broader tactical classification for lone-safe-blocker restricted races after an over-narrowed version briefly reduced per-node work but exploded tactical node count on the wide midgame benchmark
+
+Depth-6 benchmark snapshot on `2026-04-23`:
+
+Before this pass:
+
+* `initial`: `1.216s`, `2858` nodes
+* `tactical_midgame`: `3.762s`, `8273` nodes
+* `quiet_midgame`: `4.338s`, `8291` nodes
+* `restricted_threat_midgame`: `0.208s`, `640` nodes
+
+After this pass:
+
+* `initial`: `0.729s`, `2858` nodes
+* `tactical_midgame`: `2.485s`, `8273` nodes
+* `quiet_midgame`: `3.135s`, `8291` nodes
+* `restricted_threat_midgame`: `0.167s`, `640` nodes
+* `restricted_threat_repro`: `0.165s`, `636` nodes
+
+Verification after the speed pass:
+
+* `python -m pytest -q` -> `96 passed`
+* `python tools/search_benchmark.py --depth 6 --positions initial tactical_midgame quiet_midgame restricted_threat_midgame restricted_threat_repro`
+
 Repo surface note:
 
 * a desktop GUI now ships via `play_gui.py`, but this log remains search-focused
@@ -49,7 +91,7 @@ Fine-grained q-search follow-up:
 * another broad tactical-kernel pass has now landed: the hot 4-mask and 5-mask scans stop re-checking empty counts that are already implied by the incremental mask counts, and `move_map_counts` / `move_maps` now derive opponent winning replies and future wins from one shared 5-mask pass instead of two
 * a strength-oriented ordering pass has now landed: quiet-history updates are finally scaled strongly enough to matter, and quiet moves searched before a quiet beta cutoff now receive history maluses instead of being forgotten
 
-## Current Baseline
+## Historical Baseline Snapshot (2026-04-22)
 
 Verification run on `2026-04-22` after the quiet-history ordering pass:
 

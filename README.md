@@ -34,8 +34,8 @@ The current repo is not just scaffolding. These parts are implemented and covere
 
 Current verification:
 
-* `python -m pytest -q` passes: `90 passed`
-* the current representative tactical benchmark now reaches `depth=8` in about `19-27s` with a `60000ms` budget, depending on local machine load
+* `python -m pytest -q` passes: `96 passed`
+* local depth-6 benchmark on `2026-04-23`: `initial` `0.729s`, `tactical_midgame` `2.485s`, `quiet_midgame` `3.135s`, `restricted_threat_midgame` `0.167s`, `restricted_threat_repro` `0.165s`
 * representative search summaries show tactics, quiescence, and proof work dominate wall time
 * current documented ML baseline is root-policy on CPU, while quiet-value remains experimental
 
@@ -145,7 +145,7 @@ Notes:
 * the right-side engine settings area is both scrollable and collapsible to behave better at tighter window sizes or higher zoom.
 * the GUI currently keeps board size fixed at `11x11`; the engine core, tests, and ML stack are still written around that size.
 * `play_cli.py` supports `--search-summary`, `--stats-jsonl`, `--time-trace`, side-specific depth/time/model overrides, and opening sampling controls.
-* `tools/search_benchmark.py` runs the fixed search-tuning position set: `initial`, `tactical_midgame`, `immediate_double_threat`, and `quiet_midgame`.
+* `tools/search_benchmark.py` runs the fixed search-tuning position set: `initial`, `tactical_midgame`, `immediate_double_threat`, `quiet_midgame`, and the poisoned-line regression family `restricted_threat_midgame*` / `restricted_threat_repro*`.
 * `tools/ml_match_suite.py` is the recommended strength check. It uses 8 deterministic opening-prefix positions plus `quiet_midgame` and `tactical_midgame`, pairs both color assignments at `0.5s` and `1.0s`, and now supports separate `--candidate-depth` and `--baseline-depth` overrides.
 * `temperature=0` engine batches are useful for debugging or reproducing one opening, but they are no longer the recommended strength-evaluation command.
 * the primary documented ML runtime path is now root-policy on CPU, with `checkpoints/phase7_baseline.pt` as the current documented checkpoint until a new `root_policy_v1` model clears the suite.

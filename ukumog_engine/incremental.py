@@ -78,58 +78,6 @@ def _restricted_line_weight(
     return base
 
 
-def _critical_restricted_build_bits(
-    attacker_count: int,
-    defender_safe_count: int,
-    attacker_playable_bits: int,
-    defender_playable_bits: int,
-) -> int:
-    if attacker_count <= 0:
-        return 0
-    if defender_safe_count == 1:
-        return attacker_playable_bits & defender_playable_bits
-    if defender_safe_count == 0 and attacker_count >= 2:
-        return attacker_playable_bits
-    return 0
-
-
-def _accumulate_bit_bonus(target: dict[int, int], bits: int, bonus: int) -> None:
-    for move in iter_set_bits(bits):
-        target[move] = target.get(move, 0) + bonus
-
-
-def _restricted_line_profile(
-    attacker_count: int,
-    empty_bits: int,
-    attacker_poison_bits: int,
-    defender_poison_bits: int,
-    candidate_bits: int,
-) -> tuple[int, bool, int, int, int]:
-    attacker_poisoned_empty_bits = empty_bits & attacker_poison_bits
-    attacker_poisoned_empty_count = attacker_poisoned_empty_bits.bit_count()
-    attacker_playable_bits = (empty_bits & candidate_bits) & ~attacker_poisoned_empty_bits
-    defender_playable_bits = empty_bits & ~defender_poison_bits
-    defender_safe_count = defender_playable_bits.bit_count()
-    total_empty_count = empty_bits.bit_count()
-    critical_build_bits = _critical_restricted_build_bits(
-        attacker_count,
-        defender_safe_count,
-        attacker_playable_bits,
-        defender_playable_bits,
-    )
-    weight = _restricted_line_weight(
-        attacker_count,
-        defender_safe_count,
-        attacker_poisoned_empty_count,
-        total_empty_count,
-    )
-    if weight == 0:
-        return 0, False, 0, 0, 0
-
-    response_bits = defender_playable_bits & candidate_bits
-    return weight, critical_build_bits != 0, attacker_playable_bits, response_bits, critical_build_bits
-
-
 def _color_digit(color: Color) -> int:
     return 1 if color is Color.BLACK else 2
 
@@ -455,7 +403,7 @@ class IncrementalState:
     def _paired_winning_move_data(
         self,
         candidate_bits: int,
-    ) -> tuple[dict[int, tuple[int, ...]], dict[int, tuple[int, ...]], dict[int, int], dict[int, int]]:
+    ) -> tuple[dict[int, tuple[int, ...]], dict[int, tuple[int, ...]], dict[int, int], dict[int, int], int, int]:
         occupied_bits = self.occupied_bits
         black_counts = self.five_black_count
         white_counts = self.five_white_count
@@ -463,6 +411,8 @@ class IncrementalState:
         white_winning_masks: dict[int, list[int]] = {}
         black_future_bits_by_move: dict[int, int] = {}
         white_future_bits_by_move: dict[int, int] = {}
+        black_winning_bits = 0
+        white_winning_bits = 0
 
         for mask_index, mask_bits in enumerate(self._indexed.five_bitmasks):
             black_count = black_counts[mask_index]
@@ -471,6 +421,7 @@ class IncrementalState:
             if white_count == 0:
                 if black_count == 4:
                     missing_bit = mask_bits & ~occupied_bits
+                    black_winning_bits |= missing_bit
                     if missing_bit & candidate_bits:
                         move = missing_bit.bit_length() - 1
                         black_winning_masks.setdefault(move, []).append(mask_bits)
@@ -503,6 +454,7 @@ class IncrementalState:
             if black_count == 0:
                 if white_count == 4:
                     missing_bit = mask_bits & ~occupied_bits
+                    white_winning_bits |= missing_bit
                     if missing_bit & candidate_bits:
                         move = missing_bit.bit_length() - 1
                         white_winning_masks.setdefault(move, []).append(mask_bits)
@@ -537,6 +489,8 @@ class IncrementalState:
             {move: tuple(masks) for move, masks in white_winning_masks.items()},
             black_future_bits_by_move,
             white_future_bits_by_move,
+            black_winning_bits,
+            white_winning_bits,
         )
 
     def future_winning_moves_from_move(
@@ -753,14 +707,18 @@ class IncrementalState:
                 poison_moves.add(move)
         return poison_moves
 
-    def _paired_poison_move_sets_from_counts(
+    def _paired_poison_move_data(
         self,
         candidate_bits: int,
-        black_winning_moves: set[int],
-        white_winning_moves: set[int],
-    ) -> tuple[set[int], set[int]]:
+        black_candidate_winning_bits: int,
+        white_candidate_winning_bits: int,
+        black_full_winning_bits: int,
+        white_full_winning_bits: int,
+    ) -> tuple[set[int], set[int], int, int]:
         black_poison_moves: set[int] = set()
         white_poison_moves: set[int] = set()
+        black_full_poison_bits = 0
+        white_full_poison_bits = 0
         occupied_bits = self.occupied_bits
         black_counts = self.four_black_count
         white_counts = self.four_white_count
@@ -771,19 +729,21 @@ class IncrementalState:
 
             if white_count == 0 and black_count == 3:
                 missing_bit = mask_bits & ~occupied_bits
-                if missing_bit & candidate_bits:
+                if missing_bit & candidate_bits and not (missing_bit & black_candidate_winning_bits):
                     move = missing_bit.bit_length() - 1
-                    if move not in black_winning_moves:
-                        black_poison_moves.add(move)
+                    black_poison_moves.add(move)
+                if not (missing_bit & black_full_winning_bits):
+                    black_full_poison_bits |= missing_bit
 
             if black_count == 0 and white_count == 3:
                 missing_bit = mask_bits & ~occupied_bits
-                if missing_bit & candidate_bits:
+                if missing_bit & candidate_bits and not (missing_bit & white_candidate_winning_bits):
                     move = missing_bit.bit_length() - 1
-                    if move not in white_winning_moves:
-                        white_poison_moves.add(move)
+                    white_poison_moves.add(move)
+                if not (missing_bit & white_full_winning_bits):
+                    white_full_poison_bits |= missing_bit
 
-        return black_poison_moves, white_poison_moves
+        return black_poison_moves, white_poison_moves, black_full_poison_bits, white_full_poison_bits
 
     def move_maps(
         self,
@@ -885,28 +845,24 @@ class IncrementalState:
             white_winning_masks,
             black_future_bits_by_move,
             white_future_bits_by_move,
+            black_full_winning_bits,
+            white_full_winning_bits,
         ) = self._paired_winning_move_data(candidate_bits)
-        full_black_winning_masks, full_white_winning_masks, _, _ = self._paired_winning_move_data(all_empty_bits)
         black_winning_moves = tuple(move for move in ordered_candidates if move in black_winning_masks)
         white_winning_moves = tuple(move for move in ordered_candidates if move in white_winning_masks)
         black_winning_set = set(black_winning_moves)
         white_winning_set = set(white_winning_moves)
-        full_black_winning_set = set(full_black_winning_masks)
-        full_white_winning_set = set(full_white_winning_masks)
+        black_candidate_winning_bits = _moves_to_bits(black_winning_moves)
+        white_candidate_winning_bits = _moves_to_bits(white_winning_moves)
         black_opponent_winning_total = len(white_winning_moves)
         white_opponent_winning_total = len(black_winning_moves)
-        black_poison_set, white_poison_set = self._paired_poison_move_sets_from_counts(
+        black_poison_set, white_poison_set, black_poison_bits, white_poison_bits = self._paired_poison_move_data(
             candidate_bits,
-            black_winning_set,
-            white_winning_set,
+            black_candidate_winning_bits,
+            white_candidate_winning_bits,
+            black_full_winning_bits,
+            white_full_winning_bits,
         )
-        full_black_poison_set, full_white_poison_set = self._paired_poison_move_sets_from_counts(
-            all_empty_bits,
-            full_black_winning_set,
-            full_white_winning_set,
-        )
-        black_poison_bits = _moves_to_bits(full_black_poison_set)
-        white_poison_bits = _moves_to_bits(full_white_poison_set)
         black_has_opponent_wins = bool(white_winning_moves)
         white_has_opponent_wins = bool(black_winning_moves)
         if needs_ordering_maps:
@@ -932,8 +888,8 @@ class IncrementalState:
         black_restricted_pressure = 0
         black_critical_restricted_lines = 0
         black_restricted_move_pressure: dict[int, int] = {}
-        black_critical_build_set: set[int] = set()
-        black_critical_response_set: set[int] = set()
+        black_critical_build_bits = 0
+        black_critical_response_bits = 0
 
         white_safe_moves: list[int] = []
         white_poison_moves: list[int] = []
@@ -945,8 +901,8 @@ class IncrementalState:
         white_restricted_pressure = 0
         white_critical_restricted_lines = 0
         white_restricted_move_pressure: dict[int, int] = {}
-        white_critical_build_set: set[int] = set()
-        white_critical_response_set: set[int] = set()
+        white_critical_build_bits = 0
+        white_critical_response_bits = 0
 
         for move in ordered_candidates:
             if move not in black_winning_set:
@@ -1011,49 +967,94 @@ class IncrementalState:
                         if white_future_count >= 2:
                             white_double_threats.append(move)
 
-        for mask_index, mask_bits in enumerate(self._indexed.five_bitmasks):
-            empty_bits = mask_bits & all_empty_bits
-            if empty_bits == 0:
-                continue
+        if black_poison_bits or white_poison_bits:
+            restricted_counts = RESTRICTED_LINE_PROGRESS_WEIGHTS
+            for mask_index, mask_bits in enumerate(self._indexed.five_bitmasks):
+                empty_bits = mask_bits & all_empty_bits
+                if empty_bits == 0:
+                    continue
 
-            black_count = self.five_black_count[mask_index]
-            white_count = self.five_white_count[mask_index]
+                total_empty_count = empty_bits.bit_count()
+                black_count = self.five_black_count[mask_index]
+                white_count = self.five_white_count[mask_index]
 
-            if white_count == 0:
-                weight, critical, build_bits, response_bits, critical_build_bits = _restricted_line_profile(
-                    black_count,
-                    empty_bits,
-                    black_poison_bits,
-                    white_poison_bits,
-                    candidate_bits,
-                )
-                if weight:
-                    black_restricted_pressure += weight
-                    if critical:
-                        black_critical_restricted_lines += 1
-                    _accumulate_bit_bonus(black_restricted_move_pressure, build_bits, weight)
-                    _accumulate_bit_bonus(white_restricted_move_pressure, response_bits, weight)
-                    black_critical_build_set.update(iter_set_bits(critical_build_bits))
-                    if critical:
-                        white_critical_response_set.update(iter_set_bits(response_bits))
+                if white_count == 0 and black_count in restricted_counts:
+                    relevant_poison_bits = empty_bits & (black_poison_bits | white_poison_bits)
+                    if relevant_poison_bits:
+                        attacker_poisoned_empty_bits = empty_bits & black_poison_bits
+                        attacker_poisoned_empty_count = attacker_poisoned_empty_bits.bit_count()
+                        if total_empty_count > attacker_poisoned_empty_count:
+                            defender_playable_bits = empty_bits & ~white_poison_bits
+                            defender_safe_count = defender_playable_bits.bit_count()
+                            if defender_safe_count <= 1:
+                                weight = _restricted_line_weight(
+                                    black_count,
+                                    defender_safe_count,
+                                    attacker_poisoned_empty_count,
+                                    total_empty_count,
+                                )
+                                if weight:
+                                    build_bits = (empty_bits & candidate_bits) & ~attacker_poisoned_empty_bits
+                                    response_bits = defender_playable_bits & candidate_bits
+                                    if defender_safe_count == 1:
+                                        critical_build_bits = build_bits & defender_playable_bits
+                                    elif black_count >= 2:
+                                        critical_build_bits = build_bits
+                                    else:
+                                        critical_build_bits = 0
+                                    black_restricted_pressure += weight
+                                    if critical_build_bits:
+                                        black_critical_restricted_lines += 1
+                                    for move in iter_set_bits(build_bits):
+                                        black_restricted_move_pressure[move] = (
+                                            black_restricted_move_pressure.get(move, 0) + weight
+                                        )
+                                    for move in iter_set_bits(response_bits):
+                                        white_restricted_move_pressure[move] = (
+                                            white_restricted_move_pressure.get(move, 0) + weight
+                                        )
+                                    black_critical_build_bits |= critical_build_bits
+                                    if critical_build_bits:
+                                        white_critical_response_bits |= response_bits
 
-            if black_count == 0:
-                weight, critical, build_bits, response_bits, critical_build_bits = _restricted_line_profile(
-                    white_count,
-                    empty_bits,
-                    white_poison_bits,
-                    black_poison_bits,
-                    candidate_bits,
-                )
-                if weight:
-                    white_restricted_pressure += weight
-                    if critical:
-                        white_critical_restricted_lines += 1
-                    _accumulate_bit_bonus(white_restricted_move_pressure, build_bits, weight)
-                    _accumulate_bit_bonus(black_restricted_move_pressure, response_bits, weight)
-                    white_critical_build_set.update(iter_set_bits(critical_build_bits))
-                    if critical:
-                        black_critical_response_set.update(iter_set_bits(response_bits))
+                if black_count == 0 and white_count in restricted_counts:
+                    relevant_poison_bits = empty_bits & (white_poison_bits | black_poison_bits)
+                    if relevant_poison_bits:
+                        attacker_poisoned_empty_bits = empty_bits & white_poison_bits
+                        attacker_poisoned_empty_count = attacker_poisoned_empty_bits.bit_count()
+                        if total_empty_count > attacker_poisoned_empty_count:
+                            defender_playable_bits = empty_bits & ~black_poison_bits
+                            defender_safe_count = defender_playable_bits.bit_count()
+                            if defender_safe_count <= 1:
+                                weight = _restricted_line_weight(
+                                    white_count,
+                                    defender_safe_count,
+                                    attacker_poisoned_empty_count,
+                                    total_empty_count,
+                                )
+                                if weight:
+                                    build_bits = (empty_bits & candidate_bits) & ~attacker_poisoned_empty_bits
+                                    response_bits = defender_playable_bits & candidate_bits
+                                    if defender_safe_count == 1:
+                                        critical_build_bits = build_bits & defender_playable_bits
+                                    elif white_count >= 2:
+                                        critical_build_bits = build_bits
+                                    else:
+                                        critical_build_bits = 0
+                                    white_restricted_pressure += weight
+                                    if critical_build_bits:
+                                        white_critical_restricted_lines += 1
+                                    for move in iter_set_bits(build_bits):
+                                        white_restricted_move_pressure[move] = (
+                                            white_restricted_move_pressure.get(move, 0) + weight
+                                        )
+                                    for move in iter_set_bits(response_bits):
+                                        black_restricted_move_pressure[move] = (
+                                            black_restricted_move_pressure.get(move, 0) + weight
+                                        )
+                                    white_critical_build_bits |= critical_build_bits
+                                    if critical_build_bits:
+                                        black_critical_response_bits |= response_bits
 
         black_summary = IncrementalTacticalSummary(
             candidate_moves=ordered_candidates,
@@ -1072,10 +1073,10 @@ class IncrementalState:
             opponent_critical_restricted_lines=white_critical_restricted_lines,
             restricted_move_pressure=black_restricted_move_pressure,
             critical_restricted_builds=tuple(
-                move for move in ordered_candidates if move in black_critical_build_set
+                move for move in ordered_candidates if black_critical_build_bits & (1 << move)
             ),
             critical_restricted_responses=tuple(
-                move for move in ordered_candidates if move in black_critical_response_set
+                move for move in ordered_candidates if black_critical_response_bits & (1 << move)
             ),
         )
         white_summary = IncrementalTacticalSummary(
@@ -1095,10 +1096,10 @@ class IncrementalState:
             opponent_critical_restricted_lines=black_critical_restricted_lines,
             restricted_move_pressure=white_restricted_move_pressure,
             critical_restricted_builds=tuple(
-                move for move in ordered_candidates if move in white_critical_build_set
+                move for move in ordered_candidates if white_critical_build_bits & (1 << move)
             ),
             critical_restricted_responses=tuple(
-                move for move in ordered_candidates if move in white_critical_response_set
+                move for move in ordered_candidates if white_critical_response_bits & (1 << move)
             ),
         )
         return black_summary, white_summary
