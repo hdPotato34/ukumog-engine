@@ -8,6 +8,8 @@ from .solver import TacticalOutcome, TacticalSolveResult, TacticalSolveStats, Ta
 from .tactics import TacticalSnapshot, analyze_tactics, immediate_winning_moves, relevant_empty_cells
 from .validator import brute_force_move_result
 
+__version__ = "0.1.0"
+
 __all__ = [
     "BOARD_CELLS",
     "BOARD_SIZE",
@@ -41,4 +43,5 @@ __all__ = [
     "index_to_coord",
     "play_move",
     "relevant_empty_cells",
+    "__version__",
 ]
