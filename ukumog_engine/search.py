@@ -945,38 +945,17 @@ class SearchEngine:
             alpha_orig = alpha
             beta_orig = beta
             key = _position_key(position)
-            self.stats.qtt_probes += 1
-            qtt_entry = self.qtt.get(key)
-            if qtt_entry and qtt_entry.depth >= remaining_depth:
-                self.stats.qtt_hits += 1
-                if qtt_entry.bound is Bound.EXACT:
-                    return qtt_entry.score, qtt_entry.principal_variation
-                if qtt_entry.bound is Bound.LOWER:
-                    alpha = max(alpha, qtt_entry.score)
-                elif qtt_entry.bound is Bound.UPPER:
-                    beta = min(beta, qtt_entry.score)
-                if alpha >= beta:
-                    self.stats.qtt_cutoffs += 1
-                    return qtt_entry.score, qtt_entry.principal_variation
-
+            qtt_entry, alpha, beta, qtt_result = self._probe_quiescence_tt(
+                key,
+                remaining_depth,
+                alpha,
+                beta,
+            )
+            if qtt_result is not None:
+                return qtt_result
             snapshot = self._tactics(position, incremental_state, detail=TacticalDetail.BASIC)
             self._record_snapshot(snapshot)
-
-            forced = self._forced_outcome(
-                position,
-                incremental_state,
-                snapshot,
-                ply,
-                None,
-                is_pv,
-                in_quiescence=True,
-            )
-            if forced is not None:
-                return forced
-            solved = self._tactical_proof(position, snapshot, ply, in_quiescence=True, is_pv=is_pv)
-            if solved is not None:
-                return solved
-            forced_block_follow = self._follow_single_forced_block_quiescence(
+            return self._quiescence_from_snapshot(
                 position,
                 incremental_state,
                 snapshot,
@@ -988,130 +967,241 @@ class SearchEngine:
                 remaining_depth,
                 is_pv,
                 key,
-            )
-            if forced_block_follow is not None:
-                return forced_block_follow
-
-            stand_pat = self._evaluate_position(
-                position,
-                incremental_state,
-                snapshot,
-                ply,
-                is_pv,
-                in_quiescence=True,
-            )
-            if remaining_depth == 0 or not snapshot.urgent:
-                return self._store_quiescence_tt(
-                    key,
-                    remaining_depth,
-                    stand_pat,
-                    (),
-                    None,
-                    alpha_orig,
-                    beta_orig,
-                )
-            if stand_pat >= beta:
-                return self._store_quiescence_tt(
-                    key,
-                    remaining_depth,
-                    stand_pat,
-                    (),
-                    None,
-                    alpha_orig,
-                    beta_orig,
-                )
-            alpha_gap = alpha - stand_pat
-            if stand_pat > alpha:
-                alpha = stand_pat
-
-            skip_reason = self._quiescence_skip_reason(snapshot, alpha_gap, remaining_depth, is_pv)
-            if skip_reason is not None:
-                self._record_quiescence_skip_reason(skip_reason)
-                self.stats.quiescence_soft_skip_nodes += 1
-                return self._store_quiescence_tt(
-                    key,
-                    remaining_depth,
-                    stand_pat,
-                    (),
-                    None,
-                    alpha_orig,
-                    beta_orig,
-                )
-
-            candidates = self._quiescence_moves(
-                position,
-                incremental_state,
-                snapshot,
-                ply,
-                is_pv,
-                alpha_gap,
-                remaining_depth,
-                qtt_entry.best_move if qtt_entry else None,
-            )
-            if not candidates:
-                return self._store_quiescence_tt(
-                    key,
-                    remaining_depth,
-                    stand_pat,
-                    (),
-                    None,
-                    alpha_orig,
-                    beta_orig,
-                )
-
-            self._record_expansion(position.empty_count, len(candidates))
-            self.stats.tactical_extensions += 1
-            best_score = stand_pat
-            best_line: tuple[int, ...] = ()
-            best_move: int | None = None
-
-            for move in candidates:
-                result = incremental_state.move_result(move, position.side_to_move)
-                if result is MoveResult.WIN:
-                    score = MATE_SCORE - ply
-                    line = (move,)
-                elif result is MoveResult.LOSS:
-                    score = -MATE_SCORE + ply
-                    line = (move,)
-                else:
-                    undo = incremental_state.make_move(move, position.side_to_move)
-                    next_position = incremental_state.to_position()
-                    try:
-                        child_score, child_line = self._quiescence(
-                            next_position,
-                            incremental_state,
-                            -beta,
-                            -alpha,
-                            ply + 1,
-                            remaining_depth - 1,
-                            is_pv and move == candidates[0],
-                        )
-                        score = -child_score
-                        line = (move,) + child_line
-                    finally:
-                        incremental_state.unmake_move(undo)
-
-                if score > best_score:
-                    best_score = score
-                    best_line = line
-                    best_move = move
-                if best_score > alpha:
-                    alpha = best_score
-                if alpha >= beta:
-                    self.stats.cutoffs += 1
-                    break
-
-            return self._store_quiescence_tt(
-                key,
-                remaining_depth,
-                best_score,
-                best_line,
-                best_move,
-                alpha_orig,
-                beta_orig,
+                qtt_entry,
             )
         finally:
             self.stats.quiescence_time_seconds += time.perf_counter() - started_at
+
+    def _probe_quiescence_tt(
+        self,
+        key: tuple[int, int, int],
+        remaining_depth: int,
+        alpha: int,
+        beta: int,
+    ) -> tuple[TTEntry | None, int, int, tuple[int, tuple[int, ...]] | None]:
+        self.stats.qtt_probes += 1
+        qtt_entry = self.qtt.get(key)
+        if qtt_entry and qtt_entry.depth >= remaining_depth:
+            self.stats.qtt_hits += 1
+            if qtt_entry.bound is Bound.EXACT:
+                return qtt_entry, alpha, beta, (qtt_entry.score, qtt_entry.principal_variation)
+            if qtt_entry.bound is Bound.LOWER:
+                alpha = max(alpha, qtt_entry.score)
+            elif qtt_entry.bound is Bound.UPPER:
+                beta = min(beta, qtt_entry.score)
+            if alpha >= beta:
+                self.stats.qtt_cutoffs += 1
+                return qtt_entry, alpha, beta, (qtt_entry.score, qtt_entry.principal_variation)
+        return qtt_entry, alpha, beta, None
+
+    def _quiescence_from_snapshot(
+        self,
+        position: Position,
+        incremental_state: IncrementalState,
+        snapshot: TacticalSnapshot,
+        alpha: int,
+        beta: int,
+        alpha_orig: int,
+        beta_orig: int,
+        ply: int,
+        remaining_depth: int,
+        is_pv: bool,
+        key: tuple[int, int, int],
+        qtt_entry: TTEntry | None,
+    ) -> tuple[int, tuple[int, ...]]:
+        forced = self._forced_outcome(
+            position,
+            incremental_state,
+            snapshot,
+            ply,
+            None,
+            is_pv,
+            in_quiescence=True,
+        )
+        if forced is not None:
+            return forced
+        solved = self._tactical_proof(position, snapshot, ply, in_quiescence=True, is_pv=is_pv)
+        if solved is not None:
+            return solved
+        forced_block_follow = self._follow_single_forced_block_quiescence(
+            position,
+            incremental_state,
+            snapshot,
+            alpha,
+            beta,
+            alpha_orig,
+            beta_orig,
+            ply,
+            remaining_depth,
+            is_pv,
+            key,
+        )
+        if forced_block_follow is not None:
+            return forced_block_follow
+
+        stand_pat = self._evaluate_position(
+            position,
+            incremental_state,
+            snapshot,
+            ply,
+            is_pv,
+            in_quiescence=True,
+        )
+        if remaining_depth == 0 or not snapshot.urgent:
+            return self._store_quiescence_tt(
+                key,
+                remaining_depth,
+                stand_pat,
+                (),
+                None,
+                alpha_orig,
+                beta_orig,
+            )
+        if stand_pat >= beta:
+            return self._store_quiescence_tt(
+                key,
+                remaining_depth,
+                stand_pat,
+                (),
+                None,
+                alpha_orig,
+                beta_orig,
+            )
+        alpha_gap = alpha - stand_pat
+        if stand_pat > alpha:
+            alpha = stand_pat
+
+        skip_reason = self._quiescence_skip_reason(snapshot, alpha_gap, remaining_depth, is_pv)
+        if skip_reason is not None:
+            self._record_quiescence_skip_reason(skip_reason)
+            self.stats.quiescence_soft_skip_nodes += 1
+            return self._store_quiescence_tt(
+                key,
+                remaining_depth,
+                stand_pat,
+                (),
+                None,
+                alpha_orig,
+                beta_orig,
+            )
+
+        candidates = self._quiescence_moves(
+            position,
+            incremental_state,
+            snapshot,
+            ply,
+            is_pv,
+            alpha_gap,
+            remaining_depth,
+            qtt_entry.best_move if qtt_entry else None,
+        )
+        if not candidates:
+            return self._store_quiescence_tt(
+                key,
+                remaining_depth,
+                stand_pat,
+                (),
+                None,
+                alpha_orig,
+                beta_orig,
+            )
+
+        self._record_expansion(position.empty_count, len(candidates))
+        self.stats.tactical_extensions += 1
+        best_score = stand_pat
+        best_line: tuple[int, ...] = ()
+        best_move: int | None = None
+
+        for move in candidates:
+            result = incremental_state.move_result(move, position.side_to_move)
+            if result is MoveResult.WIN:
+                score = MATE_SCORE - ply
+                line = (move,)
+            elif result is MoveResult.LOSS:
+                score = -MATE_SCORE + ply
+                line = (move,)
+            else:
+                undo = incremental_state.make_move(move, position.side_to_move)
+                next_position = incremental_state.to_position()
+                try:
+                    child_score, child_line = self._quiescence(
+                        next_position,
+                        incremental_state,
+                        -beta,
+                        -alpha,
+                        ply + 1,
+                        remaining_depth - 1,
+                        is_pv and move == candidates[0],
+                    )
+                    score = -child_score
+                    line = (move,) + child_line
+                finally:
+                    incremental_state.unmake_move(undo)
+
+            if score > best_score:
+                best_score = score
+                best_line = line
+                best_move = move
+            if best_score > alpha:
+                alpha = best_score
+            if alpha >= beta:
+                self.stats.cutoffs += 1
+                break
+
+        return self._store_quiescence_tt(
+            key,
+            remaining_depth,
+            best_score,
+            best_line,
+            best_move,
+            alpha_orig,
+            beta_orig,
+        )
+
+    def _forced_chain_leaf_quiescence(
+        self,
+        position: Position,
+        incremental_state: IncrementalState,
+        alpha: int,
+        beta: int,
+        alpha_orig: int,
+        beta_orig: int,
+        ply: int,
+        remaining_depth: int,
+        is_pv: bool,
+        key: tuple[int, int, int],
+    ) -> tuple[int, tuple[int, ...], tuple[tuple[int, int, int], int, int, int, int | None] | None]:
+        qtt_entry, alpha, beta, qtt_result = self._probe_quiescence_tt(
+            key,
+            remaining_depth,
+            alpha,
+            beta,
+        )
+        if qtt_result is not None:
+            return qtt_result[0], qtt_result[1], None
+        snapshot = self._tactics(position, incremental_state, detail=TacticalDetail.BASIC)
+        self._record_snapshot(snapshot)
+        score, line = self._quiescence_from_snapshot(
+            position,
+            incremental_state,
+            snapshot,
+            alpha,
+            beta,
+            alpha_orig,
+            beta_orig,
+            ply,
+            remaining_depth,
+            is_pv,
+            key,
+            qtt_entry,
+        )
+        return score, line, (
+            key,
+            remaining_depth,
+            alpha_orig,
+            beta_orig,
+            line[0] if line else None,
+        )
 
     def _forced_outcome(
         self,
@@ -1465,6 +1555,17 @@ class SearchEngine:
                 self._check_limits()
 
                 current_key = _position_key(current_position)
+                qtt_entry, current_alpha, current_beta, qtt_result = self._probe_quiescence_tt(
+                    current_key,
+                    current_remaining_depth,
+                    current_alpha,
+                    current_beta,
+                )
+                if qtt_result is not None:
+                    leaf_score, leaf_line = qtt_result
+                    leaf_store = None
+                    break
+
                 current_snapshot = self._tactics(current_position, incremental_state, detail=TacticalDetail.BASIC)
                 self._record_snapshot(current_snapshot)
 
@@ -1473,7 +1574,7 @@ class SearchEngine:
                     incremental_state,
                     current_snapshot,
                     current_ply,
-                    None,
+                    qtt_entry.best_move if qtt_entry else None,
                     is_pv,
                     in_quiescence=True,
                 )
@@ -1507,26 +1608,41 @@ class SearchEngine:
                     break
 
                 if len(current_snapshot.forced_blocks) != 1 or not current_snapshot.opponent_winning_moves:
-                    leaf_score, leaf_line = self._quiescence(
+                    leaf_score, leaf_line = self._quiescence_from_snapshot(
                         current_position,
                         incremental_state,
+                        current_snapshot,
                         current_alpha,
                         current_beta,
+                        current_alpha_orig,
+                        current_beta_orig,
                         current_ply,
                         current_remaining_depth,
                         is_pv,
+                        current_key,
+                        qtt_entry,
+                    )
+                    leaf_store = (
+                        current_key,
+                        current_remaining_depth,
+                        current_alpha_orig,
+                        current_beta_orig,
+                        leaf_line[0] if leaf_line else None,
                     )
                     break
 
             if leaf_score is None:
-                leaf_score, leaf_line = self._quiescence(
+                leaf_score, leaf_line, leaf_store = self._forced_chain_leaf_quiescence(
                     current_position,
                     incremental_state,
                     current_alpha,
                     current_beta,
+                    current_alpha_orig,
+                    current_beta_orig,
                     current_ply,
                     current_remaining_depth,
                     is_pv,
+                    current_key,
                 )
         finally:
             while undos:

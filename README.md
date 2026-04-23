@@ -35,8 +35,8 @@ The current repo is not just scaffolding. These parts are implemented and covere
 Current verification:
 
 * `python -m pytest -q` passes: `94 passed`
-* local depth-7 opening/quiet-heavy suite on `2026-04-23`: `3.243s` average over 10 fixed positions, down from `7.888s` on the safety baseline
-* fixed depth-6 class split on `2026-04-23`: `initial` `0.657s`, `tactical_midgame` `4.558s`, `quiet_midgame` `1.283s`, `restricted_threat_midgame` `0.153s`, `restricted_threat_repro` `0.158s`
+* local depth-7 opening/quiet-heavy suite on `2026-04-23`: `2.464s` to `2.828s` average over 10 fixed positions across two passes, with `10795.6` average total nodes
+* fixed depth-6 class split on `2026-04-23`: `initial` `0.640s`, `tactical_midgame` `4.093s`, `quiet_midgame` `1.033s`, `restricted_threat_midgame` `0.123s`, `restricted_threat_repro` `0.122s`
 * representative search summaries show tactics, quiescence, and proof work dominate wall time
 * current documented ML baseline is root-policy on CPU, while quiet-value remains experimental
 
@@ -50,6 +50,26 @@ These ideas or narratives should stop being treated as active priorities:
 * the previous policy-first board-CNN workflow as a primary direction; it is now legacy comparison-only
 
 The bottleneck has shifted. On real search traces, the expensive buckets are tactical analysis, quiescence, and tactical proof/selectivity. The right next push is deeper and cleaner search, not more eval micro-optimization.
+
+## Next Destination
+
+The single-forced-block q-search compression pass is now in place, so the next-stage priority has shifted:
+
+* first: reduce shared tactical cost on the surviving wide tactical nodes
+* second: only revisit another node-shape reduction pass if profiling still shows a clean tactical win afterward
+* later: revisit ML only as root-policy guidance after the search baseline stabilizes again
+
+Why:
+
+* the forced-chain hotspot is materially cheaper now
+* the remaining expensive class is still `tactical_midgame`, but it is no longer best described as a chain-boundary problem
+* that points back to shared tactical kernel and cache reuse questions before any heavier evaluator work
+
+Practical takeaway:
+
+* a new AI evaluator is still not the best next move
+* the best next search work is a broad but guarded tactical-cost pass, not another quiet-threat side channel
+* ML should stay supportive and root-focused until the search baseline settles again
 
 ## How To Run
 

@@ -30,6 +30,21 @@ The active ML direction is now:
 2. train with `python -m ukumog_engine.ml.train_root_policy`
 3. evaluate with `python tools/ml_match_suite.py`
 
+## Near-Term ML Stance
+
+Even within the active ML direction, ML is currently a follow-up priority rather than the immediate next engine task.
+
+Current recommended sequencing:
+
+1. stabilize search and q-search behavior first
+2. re-run root-policy experiments only after the search baseline stops moving
+3. keep quiet-value and heavier evaluator ideas archived until search is no longer the main limiter
+
+Practical reading:
+
+* root-policy remains the only ML path that still fits the repo's search-first direction cleanly
+* learned evaluation should not be the next major project while tactical-chain search remains the dominant hotspot
+
 ## Why These Legacy Assets Stay
 
 They remain useful for:

@@ -4,6 +4,58 @@ Active search-engine roadmap and measurement log for the current repo state.
 
 Historical context lives in [README_HISTORY_20260421.md](archive/README_HISTORY_20260421.md). That archive is still worth keeping around because it records how Stages 1-5 were reached, but this file is the active search-specific planning document going forward.
 
+## Latest Update: 2026-04-23 Single-Forced-Block Chain Compression
+
+The next-stage q-search pass is now landed.
+
+The core change was structural rather than tactical-pattern-specific:
+
+* split `_quiescence` into a thin entry path plus a `_quiescence_from_snapshot` continuation path
+* added `_probe_quiescence_tt` so forced-block chain nodes can reuse q-search TT logic without bouncing back through a fresh `_quiescence` frame
+* changed `_follow_single_forced_block_quiescence` so singleton reply chains stay inside the same search-side flow until the chain truly branches or terminates
+* when a chain reaches a non-singleton tactical node, continue from the already-built child snapshot instead of re-entering `_quiescence` and recomputing the same node boundary work
+
+Why this helped:
+
+* the previous chain follower flattened the move sequence, but it still paid a second full q-search entry cost at the leaf boundary
+* that meant duplicate TT probing, duplicate tactical entry/setup logic, and extra recursive frame overhead exactly in the hotspot class
+* the new version keeps the work on the search side and only falls back to full recursive q-search when it is actually searching child candidates, not when it is merely crossing the forced-chain boundary
+
+Depth-6 benchmark snapshot on `2026-04-23`:
+
+Before this pass, current baseline:
+
+* `initial`: `0.657s`, `2858` nodes
+* `tactical_midgame`: `4.558s`, `16122` nodes
+* `quiet_midgame`: `1.283s`, `4812` nodes
+* `restricted_threat_midgame`: `0.153s`, `505` nodes
+* `restricted_threat_repro`: `0.158s`, `505` nodes
+
+After this pass:
+
+* `initial`: `0.640s`, `2855` nodes
+* `tactical_midgame`: `4.093s`, `15136` nodes
+* `quiet_midgame`: `1.033s`, `4333` nodes
+* `restricted_threat_midgame`: `0.123s`, `497` nodes
+* `restricted_threat_repro`: `0.122s`, `497` nodes
+
+Fixed depth-7 real-play suite on `2026-04-23`:
+
+* the 8 opening-prefix positions plus `quiet_midgame` and `tactical_midgame` now averaged `2.464s` to `2.828s` across two local passes
+* average total nodes on that suite were `10795.6`, down from the previously documented `11959.3`
+
+Interpretation:
+
+* this is a real search-shape improvement, not only a per-node micro-optimization
+* the dominant single-forced-block q-chain class is still expensive, but it is materially cheaper now
+* `tactical_midgame` remains the main noisiest and most expensive benchmark, so the next work should target shared tactical cost on the surviving nodes rather than reopening quiet-threat side channels
+
+Verification after this pass:
+
+* `python -m pytest -q` -> `94 passed`
+* `python tools/search_benchmark.py --depth 6`
+* two local depth-7 fixed-suite passes via `tools.ml_match_suite.default_suite_positions()`
+
 ## Latest Update: 2026-04-23 First-Principles Quiet-Threat Rollback
 
 The safety-commit investigation made the main structural problem clear: the engine was no longer just "evaluating quiet threats." It was running hidden mini-searches for them inside normal move ordering and inside the main negamax loop.
@@ -70,6 +122,91 @@ Verification after this pass:
 
 * `python -m pytest -q` -> `94 passed`
 * `python tools/search_benchmark.py --depth 6 --positions initial tactical_midgame quiet_midgame restricted_threat_midgame restricted_threat_repro`
+
+## Roadmap From Here
+
+After the first-principles rollback, the next destination is clearer than it was before:
+
+1. Fix tactical sharpness and throughput together inside q-search and forced-block handling.
+2. Only do another broad tactical-kernel speed pass if profiling still shows a clear shared hotspot.
+3. Keep ML in a supporting role until search stabilizes again across both the real-play suite and the tactical benchmark.
+
+Why this ordering:
+
+* the broad depth-7 real-play suite now looks much healthier
+* the remaining bad class is concentrated rather than global
+* that class is exactly the kind of thing the search should solve directly rather than by adding another expensive quiet-threat side channel
+
+### Next Destination: Tactical Chain Handling
+
+The highest-value next stage is not a full AI evaluator and not another generic speed cleanup. It is a search-design pass aimed at the new dominant failure/cost shape:
+
+* many single-forced-block q-nodes
+* tactical-midgame widening after the quiet-threat helper removal
+* too much repeated work along forced reply chains
+
+The target should be a direct, explicit chain handler for single-forced-block tactical sequences, with strict scope:
+
+* only activate when the reply set is genuinely singleton and stable
+* do not recompute broad tactical summaries more than necessary along the chain
+* keep the logic inside q-search / tactical extension handling, not hidden inside quiet move ordering
+* measure both node count and wall time on `tactical_midgame` plus the fixed real-play suite
+
+This is the best next step because it attacks the new hotspot at the right boundary: the tactical frontier itself.
+
+Scoped attempt note:
+
+* a first lightweight q-search chain-summary experiment was tried immediately after this roadmap update
+* the idea was to replace full tactical summaries on continuing single-forced-block q-chain nodes with a minimal forced-chain summary
+* that version did not beat the current baseline in local measurement and was backed out rather than landed
+* practical reading: the right next experiment is now narrower, likely either better cache reuse on chain nodes or search-side chain compression, not a separate uncached tactical-summary path
+
+### ML Stance
+
+ML should not be the next primary push.
+
+Recommended near-term stance:
+
+* do not prioritize a new quiet-value evaluator pass yet
+* do not spend the next stage on learned weights for static eval blending
+* keep root-policy as the only ML path worth active attention once the search baseline settles again
+
+Practical reading:
+
+* root-policy can still be useful later for root ordering and equal-time conversion
+* full-board learned evaluation is still downstream of search quality and search stability
+* the repo is not yet in the state where a stronger evaluator is the cleanest next bottleneck break
+
+### Efficiency Curriculum
+
+Efficiency still matters, but it should now be subordinate to tactical-shape work rather than treated as a separate first move.
+
+The right efficiency questions for the next stage are:
+
+* after a direct forced-block-chain pass, is `paired_tactical_summaries` still the main broad hotspot?
+* does the shared poison/restricted scan still dominate enough to justify another kernel refactor?
+* can q-search reuse or lightweight summaries reduce repeated tactical recomputation on chain nodes?
+
+If the answer to those stays "yes" after the tactical-chain work, then another kernel cleanup is justified. If not, more low-level cleanup would be polishing the wrong wall.
+
+### Acceptance Gates
+
+Future search work should pass all of these, not just one:
+
+* `python -m pytest -q`
+* `python tools/search_benchmark.py --depth 6 --positions initial tactical_midgame quiet_midgame restricted_threat_midgame restricted_threat_repro`
+* the fixed depth-7 real-play suite of 8 opening-prefix positions plus `quiet_midgame` and `tactical_midgame`
+* at least one equal-time engine-vs-engine or `tools/ml_match_suite.py` check before declaring a node-shape change "good"
+
+### Practical Priority Order
+
+If I were sequencing the next work from the current repo state, I would do it in this order:
+
+1. Implement and profile a direct single-forced-block chain handler in q-search / tactical extensions.
+2. Re-benchmark tactical-midgame and the fixed depth-7 real-play suite to see whether the tactical widening comes back under control.
+3. Only then decide whether another tactical-kernel cleanup is still worth doing.
+4. Once search behavior is stable again, refresh the root-policy baseline and rerun the ML match suite.
+5. Leave quiet-value and heavier evaluator ideas archived unless search stops being the main limiter.
 
 ## Latest Update: 2026-04-23 Speed Recovery Pass
 
