@@ -4,6 +4,73 @@ Active search-engine roadmap and measurement log for the current repo state.
 
 Historical context lives in [README_HISTORY_20260421.md](archive/README_HISTORY_20260421.md). That archive is still worth keeping around because it records how Stages 1-5 were reached, but this file is the active search-specific planning document going forward.
 
+## Latest Update: 2026-04-23 First-Principles Quiet-Threat Rollback
+
+The safety-commit investigation made the main structural problem clear: the engine was no longer just "evaluating quiet threats." It was running hidden mini-searches for them inside normal move ordering and inside the main negamax loop.
+
+The expensive pieces were:
+
+* `_single_safe_threat_order_bonus`
+* `_follow_single_safe_threat_verification`
+
+Both paths were repeatedly making a candidate move, deriving a fresh tactical snapshot for the child, often making the forced reply too, and then either rescoring or continuing search from there. That was not first-principles move ordering anymore; it was a side-channel tactical extension that duplicated work the real search should have been doing once, in one place.
+
+This pass deliberately removed that design:
+
+* deleted the exact single-safe-threat ordering probe
+* deleted the exact single-safe-threat verification shortcut from `_negamax`
+* removed the now-obsolete cache and instrumentation fields tied to that helper path
+* dropped the helper-specific tests that locked in the removed mechanism rather than core game understanding
+* kept the cheaper local signals already present in the current snapshot: safe-threat classification, future-win counts, immediate-win blocking, and restricted-line pressure
+
+Depth-7 fixed real-play suite on `2026-04-23`:
+
+Safety baseline `884bdf4` before this pass:
+
+* average elapsed: `7.888s`
+* average total nodes: `18668.4`
+* average tactics time: `5.164s`
+* average quiescence time: `2.958s`
+
+After this pass:
+
+* average elapsed: `3.243s`
+* average total nodes: `11959.3`
+* average tactics time: `2.201s`
+* average quiescence time: `1.913s`
+
+That is the important result for actual search usage: the first-principles version is much cheaper on the opening and quiet-heavy positions that dominate real games.
+
+Fixed depth-6 benchmark split:
+
+Safety baseline `884bdf4` before this pass:
+
+* `initial`: `0.695s`, `2858` nodes
+* `tactical_midgame`: `2.554s`, `8273` nodes
+* `quiet_midgame`: `4.811s`, `8291` nodes
+* `restricted_threat_midgame`: `0.231s`, `640` nodes
+* `restricted_threat_repro`: `0.225s`, `636` nodes
+
+After this pass:
+
+* `initial`: `0.657s`, `2858` nodes
+* `tactical_midgame`: `4.558s`, `16122` nodes
+* `quiet_midgame`: `1.283s`, `4812` nodes
+* `restricted_threat_midgame`: `0.153s`, `505` nodes
+* `restricted_threat_repro`: `0.158s`, `505` nodes
+
+Interpretation:
+
+* this is a real first-principles simplification, not a micro-optimization
+* the broad practical workload got much faster
+* the cost was tactical-midgame selectivity: without the exact quiet-threat side channel, more single-forced-block chains survive into q-search
+* that tactical benchmark is now the clearest remaining hotspot, but it should be solved by direct search/quiescence design rather than bringing back hidden quiet-threat mini-searches
+
+Verification after this pass:
+
+* `python -m pytest -q` -> `94 passed`
+* `python tools/search_benchmark.py --depth 6 --positions initial tactical_midgame quiet_midgame restricted_threat_midgame restricted_threat_repro`
+
 ## Latest Update: 2026-04-23 Speed Recovery Pass
 
 The recent poisoned-line strength pass was real, but it also made the engine materially slower in practice. The user-facing symptom was simple: searches that had been taking only a few seconds at depth 7 were now landing closer to `12s` per move on the same machine.

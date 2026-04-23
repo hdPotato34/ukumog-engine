@@ -34,8 +34,9 @@ The current repo is not just scaffolding. These parts are implemented and covere
 
 Current verification:
 
-* `python -m pytest -q` passes: `96 passed`
-* local depth-6 benchmark on `2026-04-23`: `initial` `0.729s`, `tactical_midgame` `2.485s`, `quiet_midgame` `3.135s`, `restricted_threat_midgame` `0.167s`, `restricted_threat_repro` `0.165s`
+* `python -m pytest -q` passes: `94 passed`
+* local depth-7 opening/quiet-heavy suite on `2026-04-23`: `3.243s` average over 10 fixed positions, down from `7.888s` on the safety baseline
+* fixed depth-6 class split on `2026-04-23`: `initial` `0.657s`, `tactical_midgame` `4.558s`, `quiet_midgame` `1.283s`, `restricted_threat_midgame` `0.153s`, `restricted_threat_repro` `0.158s`
 * representative search summaries show tactics, quiescence, and proof work dominate wall time
 * current documented ML baseline is root-policy on CPU, while quiet-value remains experimental
 

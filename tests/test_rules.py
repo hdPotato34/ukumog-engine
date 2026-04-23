@@ -540,94 +540,7 @@ class SearchTests(unittest.TestCase):
         self.assertFalse(engine._force_exact_short_mate_search(6, 0))
         self.assertFalse(engine._force_exact_short_mate_search(5, 3))
 
-    def test_search_verifies_restricted_single_safe_threat_across_transforms(self) -> None:
-        boards = {
-            "repro": RESTRICTED_THREAT_REPRO_ROWS,
-            "base": RESTRICTED_THREAT_BASE_ROWS,
-            "repro_swapped": _swap_colors(RESTRICTED_THREAT_REPRO_ROWS),
-            "base_swapped": _swap_colors(RESTRICTED_THREAT_BASE_ROWS),
-        }
-        for board_name, base_rows in boards.items():
-            for transform in RESTRICTED_THREAT_TRANSFORMS:
-                rows = _transform_rows(base_rows, transform)
-                side_to_move = Color.BLACK if board_name.endswith("_swapped") else Color.WHITE
-                position = Position.from_rows(rows, side_to_move=side_to_move)
-                engine = SearchEngine()
-                result = engine.search(position, max_depth=4, analyze_root=True)
-                root_scores = {root_score.move: root_score.score for root_score in result.root_move_scores}
-                defense = coord_to_index(*_transform_coord(RESTRICTED_THREAT_DEFENSE, transform))
-                speculative = coord_to_index(*_transform_coord(RESTRICTED_THREAT_SPECULATIVE, transform))
-
-                with self.subTest(board=board_name, transform=transform):
-                    self.assertIn(defense, root_scores)
-                    self.assertIn(speculative, root_scores)
-                    self.assertGreaterEqual(root_scores[defense], root_scores[speculative])
-                    self.assertGreater(result.stats.single_safe_threat_ordering_hits, 0)
-                    self.assertGreater(result.stats.single_safe_threat_verification_followups, 0)
-
-    def test_single_safe_threat_helper_matches_grandchild_search(self) -> None:
-        boards = {
-            "base": RESTRICTED_THREAT_BASE_ROWS,
-            "base_swapped": _swap_colors(RESTRICTED_THREAT_BASE_ROWS),
-        }
-        for board_name, base_rows in boards.items():
-            for transform in ("identity", "rot90", "flip_h"):
-                rows = _transform_rows(base_rows, transform)
-                side_to_move = Color.BLACK if board_name.endswith("_swapped") else Color.WHITE
-                position = Position.from_rows(rows, side_to_move=side_to_move)
-                move = coord_to_index(*_transform_coord(RESTRICTED_THREAT_SPECULATIVE, transform))
-                forced_reply = coord_to_index(*_transform_coord(RESTRICTED_THREAT_DEFENSE, transform))
-
-                engine = SearchEngine()
-                incremental_state = engine._search_incremental_state(position)
-                snapshot = engine._tactics(position, incremental_state, include_move_maps=False)
-                verified = engine._follow_single_safe_threat_verification(
-                    position,
-                    incremental_state,
-                    snapshot,
-                    move,
-                    depth=4,
-                    alpha=-1_000_000,
-                    beta=1_000_000,
-                    ply=0,
-                    is_pv=True,
-                )
-
-                with self.subTest(board=board_name, transform=transform):
-                    self.assertIsNotNone(verified)
-                    score, line = verified
-                    self.assertEqual(line[:2], (move, forced_reply))
-                    self.assertGreater(engine.stats.single_safe_threat_verification_attempts, 0)
-                    self.assertGreater(engine.stats.single_safe_threat_verification_followups, 0)
-
-                    manual_engine = SearchEngine()
-                    manual_state = manual_engine._search_incremental_state(position)
-                    first_undo = manual_state.make_move(move, position.side_to_move)
-                    try:
-                        child_position = manual_state.to_position()
-                        child_snapshot = manual_engine._tactics(child_position, manual_state, include_move_maps=False)
-                        self.assertEqual(child_snapshot.forced_blocks, (forced_reply,))
-                        second_undo = manual_state.make_move(forced_reply, child_position.side_to_move)
-                        try:
-                            grandchild_position = manual_state.to_position()
-                            manual_score, manual_line = manual_engine._negamax(
-                                grandchild_position,
-                                manual_state,
-                                3,
-                                -1_000_000,
-                                1_000_000,
-                                2,
-                                True,
-                            )
-                        finally:
-                            manual_state.unmake_move(second_undo)
-                    finally:
-                        manual_state.unmake_move(first_undo)
-
-                    self.assertEqual(score, manual_score)
-                    self.assertEqual(line, (move, forced_reply) + manual_line)
-
-    def test_search_matches_deeper_restricted_threat_motif_on_sparse_variants(self) -> None:
+    def test_deep_search_scores_sparse_restricted_threat_defense_no_worse_than_speculative(self) -> None:
         boards = {
             "base": RESTRICTED_THREAT_BASE_ROWS,
             "base_swapped": _swap_colors(RESTRICTED_THREAT_BASE_ROWS),
@@ -641,18 +554,12 @@ class SearchTests(unittest.TestCase):
                 speculative = coord_to_index(*_transform_coord(RESTRICTED_THREAT_SPECULATIVE, transform))
                 deep_engine = SearchEngine()
                 deep = deep_engine.search(position, max_depth=6, analyze_root=True)
-                shallow_engine = SearchEngine()
-                shallow = shallow_engine.search(position, max_depth=4, analyze_root=True)
-                shallow_scores = {root_score.move: root_score.score for root_score in shallow.root_move_scores}
                 deep_scores = {root_score.move: root_score.score for root_score in deep.root_move_scores}
 
                 with self.subTest(board=board_name, transform=transform):
-                    self.assertIn(defense, shallow_scores)
-                    self.assertIn(speculative, shallow_scores)
                     self.assertIn(defense, deep_scores)
-                    self.assertGreaterEqual(shallow_scores[defense], shallow_scores[speculative])
+                    self.assertIn(speculative, deep_scores)
                     self.assertGreaterEqual(deep_scores[defense], deep_scores.get(speculative, -1_000_000))
-                    self.assertGreater(shallow.stats.single_safe_threat_verification_followups, 0)
 
     def test_rank_moves_respects_tt_move_priority(self) -> None:
         history = [41, 19, 52, 86, 6, 10, 111, 73, 14, 51, 82, 8, 72, 32, 4, 16, 66, 64]

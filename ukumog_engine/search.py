@@ -26,12 +26,6 @@ SAFE_MOVE_BONUS = 20_000
 KILLER_MOVE_BONUS = 40_000
 SECOND_KILLER_BONUS = 25_000
 FUTURE_WIN_BONUS = 8_000
-VERIFIED_SINGLE_SAFE_THREAT_REPLY_BONUS = 10_000
-VERIFIED_SINGLE_SAFE_THREAT_CHAIN_BONUS = 16_000
-VERIFIED_SINGLE_SAFE_THREAT_DOUBLE_BONUS = 48_000
-VERIFIED_SINGLE_SAFE_THREAT_WIN_BONUS = 84_000
-VERIFIED_SINGLE_SAFE_THREAT_RECURSIVE_BONUS = 12_000
-VERIFIED_SINGLE_SAFE_THREAT_COUNTER_PENALTY = 48_000
 POISON_MOVE_PENALTY = 200_000
 FIVE_MASK_LOCAL_BONUS = 16
 FOUR_MASK_LOCAL_BONUS = 6
@@ -100,11 +94,6 @@ class SearchStats:
     quiescence_skip_frontier_safe_threat_nodes: int = 0
     quiescence_skip_wide_safe_threat_nodes: int = 0
     quiescence_skip_alpha_safe_threat_nodes: int = 0
-    single_safe_threat_ordering_probes: int = 0
-    single_safe_threat_ordering_hits: int = 0
-    single_safe_threat_verification_attempts: int = 0
-    single_safe_threat_verification_followups: int = 0
-    single_safe_threat_verification_resolved: int = 0
     immediate_win_nodes: int = 0
     safe_threat_nodes: int = 0
     double_threat_nodes: int = 0
@@ -280,11 +269,6 @@ class SearchStats:
             "quiescence_skip_frontier_safe_threat_nodes": self.quiescence_skip_frontier_safe_threat_nodes,
             "quiescence_skip_wide_safe_threat_nodes": self.quiescence_skip_wide_safe_threat_nodes,
             "quiescence_skip_alpha_safe_threat_nodes": self.quiescence_skip_alpha_safe_threat_nodes,
-            "single_safe_threat_ordering_probes": self.single_safe_threat_ordering_probes,
-            "single_safe_threat_ordering_hits": self.single_safe_threat_ordering_hits,
-            "single_safe_threat_verification_attempts": self.single_safe_threat_verification_attempts,
-            "single_safe_threat_verification_followups": self.single_safe_threat_verification_followups,
-            "single_safe_threat_verification_resolved": self.single_safe_threat_verification_resolved,
             "immediate_win_nodes": self.immediate_win_nodes,
             "forced_win_nodes": self.forced_win_nodes,
             "forced_loss_nodes": self.forced_loss_nodes,
@@ -398,17 +382,6 @@ class SearchStats:
                 f"skip_frontier={self.quiescence_skip_frontier_safe_threat_nodes} "
                 f"skip_wide={self.quiescence_skip_wide_safe_threat_nodes} "
                 f"skip_alpha={self.quiescence_skip_alpha_safe_threat_nodes}"
-            ),
-            (
-                "single-threat order "
-                f"probes={self.single_safe_threat_ordering_probes} "
-                f"hits={self.single_safe_threat_ordering_hits}"
-            ),
-            (
-                "single-threat verify "
-                f"attempts={self.single_safe_threat_verification_attempts} "
-                f"followups={self.single_safe_threat_verification_followups} "
-                f"resolved={self.single_safe_threat_verification_resolved}"
             ),
             (
                 f"ml calls={self.model_calls_total} root={self.model_calls_root} pv_quiet={self.model_calls_pv_quiet} "
@@ -575,7 +548,6 @@ class SearchEngine:
         self.qtt: dict[tuple[int, int, int], TTEntry] = {}
         self.tactics_cache: dict[tuple[int, int, int, int], TacticalSnapshot] = {}
         self.tactics_pair_cache: dict[tuple[int, int, int], tuple[TacticalSnapshot, TacticalSnapshot]] = {}
-        self.single_safe_threat_order_cache: dict[tuple[int, int, int, int], int] = {}
         self.history: list[list[int]] = [[0] * BOARD_CELLS for _ in range(2)]
         self.killers: dict[int, list[int | None]] = {}
         self.stats = SearchStats()
@@ -613,7 +585,6 @@ class SearchEngine:
         self.qtt = {}
         self.tactics_cache = {}
         self.tactics_pair_cache = {}
-        self.single_safe_threat_order_cache = {}
         self.killers = {}
         self.tactical_solver.reset()
         if self.learned_evaluator is not None and hasattr(self.learned_evaluator, "reset"):
@@ -802,119 +773,105 @@ class SearchEngine:
                 score = -MATE_SCORE + ply
                 line = (move,)
             else:
-                verified = self._follow_single_safe_threat_verification(
-                    position,
-                    incremental_state,
-                    snapshot,
-                    move,
-                    depth,
-                    alpha,
-                    beta,
-                    ply,
-                    is_pv and move_index == 0,
-                )
-                if verified is not None:
-                    score, line = verified
-                else:
-                    undo = incremental_state.make_move(move, position.side_to_move)
-                    next_position = incremental_state.to_position()
-                    try:
-                        if root_collect:
+                undo = incremental_state.make_move(move, position.side_to_move)
+                next_position = incremental_state.to_position()
+                try:
+                    if root_collect:
+                        child_score, child_line = self._negamax(
+                            next_position,
+                            incremental_state,
+                            depth - 1,
+                            -MATE_SCORE,
+                            MATE_SCORE,
+                            ply + 1,
+                            is_pv and move_index == 0,
+                        )
+                        score = -child_score
+                        line = (move,) + child_line
+                    elif exact_short_mate_quiet:
+                        self.stats.exact_short_mate_quiet_searches += 1
+                        child_score, child_line = self._negamax(
+                            next_position,
+                            incremental_state,
+                            depth - 1,
+                            -beta,
+                            -alpha,
+                            ply + 1,
+                            False,
+                        )
+                        score = -child_score
+                        line = (move,) + child_line
+                    elif move_index == 0:
+                        child_score, child_line = self._negamax(
+                            next_position,
+                            incremental_state,
+                            depth - 1,
+                            -beta,
+                            -alpha,
+                            ply + 1,
+                            is_pv,
+                        )
+                        score = -child_score
+                        line = (move,) + child_line
+                    else:
+                        if (
+                            depth >= LATE_MOVE_REDUCTION_MIN_DEPTH
+                            and move_index >= LATE_MOVE_REDUCTION_AFTER
+                            and is_quiet
+                            and not exact_short_mate_quiet
+                        ):
+                            reduced_depth = max(depth - 2, 0)
                             child_score, child_line = self._negamax(
                                 next_position,
                                 incremental_state,
-                                depth - 1,
-                                -MATE_SCORE,
-                                MATE_SCORE,
-                                ply + 1,
-                                is_pv and move_index == 0,
-                            )
-                            score = -child_score
-                            line = (move,) + child_line
-                        elif exact_short_mate_quiet:
-                            self.stats.exact_short_mate_quiet_searches += 1
-                            child_score, child_line = self._negamax(
-                                next_position,
-                                incremental_state,
-                                depth - 1,
-                                -beta,
+                                reduced_depth,
+                                -alpha - 1,
                                 -alpha,
                                 ply + 1,
                                 False,
                             )
                             score = -child_score
                             line = (move,) + child_line
-                        elif move_index == 0:
-                            child_score, child_line = self._negamax(
-                                next_position,
-                                incremental_state,
-                                depth - 1,
-                                -beta,
-                                -alpha,
-                                ply + 1,
-                                is_pv,
-                            )
-                            score = -child_score
-                            line = (move,) + child_line
-                        else:
-                            if (
-                                depth >= LATE_MOVE_REDUCTION_MIN_DEPTH
-                                and move_index >= LATE_MOVE_REDUCTION_AFTER
-                                and is_quiet
-                                and not exact_short_mate_quiet
-                            ):
-                                reduced_depth = max(depth - 2, 0)
-                                child_score, child_line = self._negamax(
-                                    next_position,
-                                    incremental_state,
-                                    reduced_depth,
-                                    -alpha - 1,
-                                    -alpha,
-                                    ply + 1,
-                                    False,
-                                )
-                                score = -child_score
-                                line = (move,) + child_line
-                                if score > alpha:
-                                    self.stats.late_move_researches += 1
-                                    child_score, child_line = self._negamax(
-                                        next_position,
-                                        incremental_state,
-                                        depth - 1,
-                                        -beta,
-                                        -alpha,
-                                        ply + 1,
-                                        False,
-                                    )
-                                    score = -child_score
-                                    line = (move,) + child_line
-                            else:
+                            if score > alpha:
+                                self.stats.late_move_researches += 1
                                 child_score, child_line = self._negamax(
                                     next_position,
                                     incremental_state,
                                     depth - 1,
-                                    -alpha - 1,
+                                    -beta,
                                     -alpha,
                                     ply + 1,
                                     False,
                                 )
                                 score = -child_score
                                 line = (move,) + child_line
-                                if alpha < score < beta:
-                                    self.stats.pvs_researches += 1
-                                    child_score, child_line = self._negamax(
-                                        next_position,
-                                        incremental_state,
-                                        depth - 1,
-                                        -beta,
-                                        -alpha,
-                                        ply + 1,
-                                        False,
-                                    )
-                                    score = -child_score
-                                    line = (move,) + child_line
-                    finally:
-                        incremental_state.unmake_move(undo)
+                        else:
+                            child_score, child_line = self._negamax(
+                                next_position,
+                                incremental_state,
+                                depth - 1,
+                                -alpha - 1,
+                                -alpha,
+                                ply + 1,
+                                False,
+                            )
+                            score = -child_score
+                            line = (move,) + child_line
+                            if alpha < score < beta:
+                                self.stats.pvs_researches += 1
+                                child_score, child_line = self._negamax(
+                                    next_position,
+                                    incremental_state,
+                                    depth - 1,
+                                    -beta,
+                                    -alpha,
+                                    ply + 1,
+                                    False,
+                                )
+                                score = -child_score
+                                line = (move,) + child_line
+                finally:
+                    incremental_state.unmake_move(undo)
 
             if score > best_score:
                 best_score = score
@@ -1622,139 +1579,6 @@ class SearchEngine:
             return QUIESCENCE_NONPV_SAFE_THREAT_LIMIT
         return min(QUIESCENCE_SAFE_THREAT_LIMIT, QUIESCENCE_NONPV_SAFE_THREAT_NEGATIVE_ALPHA_LIMIT)
 
-    def _follow_single_safe_threat_verification(
-        self,
-        position: Position,
-        incremental_state: IncrementalState,
-        snapshot: TacticalSnapshot,
-        move: int,
-        depth: int,
-        alpha: int,
-        beta: int,
-        ply: int,
-        is_pv: bool,
-    ) -> tuple[int, tuple[int, ...]] | None:
-        if depth <= 0 or move not in snapshot.safe_threats or move in snapshot.double_threats:
-            return None
-
-        self.stats.single_safe_threat_verification_attempts += 1
-        if incremental_state.move_result(move, position.side_to_move) is not MoveResult.NONTERMINAL:
-            return None
-
-        first_undo = incremental_state.make_move(move, position.side_to_move)
-        try:
-            child_position = incremental_state.to_position()
-            child_snapshot = self._tactics(child_position, incremental_state, detail=TacticalDetail.BASIC)
-            self._record_snapshot(child_snapshot)
-            if len(child_snapshot.forced_blocks) != 1 or len(child_snapshot.opponent_winning_moves) != 1:
-                return None
-
-            forced_block = child_snapshot.forced_blocks[0]
-            self.stats.single_safe_threat_verification_followups += 1
-            self._record_expansion(child_position.empty_count, 1)
-            self.stats.tactical_extensions += 1
-            forced_result = incremental_state.move_result(forced_block, child_position.side_to_move)
-            if forced_result is MoveResult.WIN:
-                self.stats.single_safe_threat_verification_resolved += 1
-                return -MATE_SCORE + ply + 1, (move, forced_block)
-            if forced_result is MoveResult.LOSS:
-                self.stats.single_safe_threat_verification_resolved += 1
-                return MATE_SCORE - ply - 1, (move, forced_block)
-
-            second_undo = incremental_state.make_move(forced_block, child_position.side_to_move)
-            try:
-                grandchild_position = incremental_state.to_position()
-                score, line = self._negamax(
-                    grandchild_position,
-                    incremental_state,
-                    depth - 1,
-                    alpha,
-                    beta,
-                    ply + 2,
-                    is_pv,
-                )
-            finally:
-                incremental_state.unmake_move(second_undo)
-        finally:
-            incremental_state.unmake_move(first_undo)
-
-        if abs(score) >= MATE_SCORE - 5_000:
-            self.stats.single_safe_threat_verification_resolved += 1
-        return score, (move, forced_block) + line
-
-    def _single_safe_threat_order_bonus(
-        self,
-        position: Position,
-        incremental_state: IncrementalState,
-        snapshot: TacticalSnapshot,
-        move: int,
-        future_hint: int,
-        ply: int,
-        is_pv: bool,
-        in_quiescence: bool,
-    ) -> int:
-        if (
-            in_quiescence
-            or snapshot.opponent_winning_moves
-            or move not in snapshot.safe_moves
-            or move in snapshot.winning_moves
-            or move in snapshot.double_threats
-            or (move not in snapshot.safe_threats and future_hint <= 0)
-            or (not is_pv and ply > 1)
-        ):
-            return 0
-
-        key = (*_position_key(position), move)
-        cached = self.single_safe_threat_order_cache.get(key)
-        if cached is not None:
-            return cached
-
-        self.stats.single_safe_threat_ordering_probes += 1
-        bonus = 0
-        if incremental_state.move_result(move, position.side_to_move) is not MoveResult.NONTERMINAL:
-            self.single_safe_threat_order_cache[key] = 0
-            return 0
-
-        first_undo = incremental_state.make_move(move, position.side_to_move)
-        try:
-            child_position = incremental_state.to_position()
-            child_snapshot = self._tactics(child_position, incremental_state, detail=TacticalDetail.BASIC)
-            if len(child_snapshot.forced_blocks) != 1 or len(child_snapshot.opponent_winning_moves) != 1:
-                self.single_safe_threat_order_cache[key] = 0
-                return 0
-
-            self.stats.single_safe_threat_ordering_hits += 1
-            forced_block = child_snapshot.forced_blocks[0]
-            bonus += VERIFIED_SINGLE_SAFE_THREAT_REPLY_BONUS
-            forced_result = incremental_state.move_result(forced_block, child_position.side_to_move)
-            if forced_result is MoveResult.WIN:
-                bonus -= VERIFIED_SINGLE_SAFE_THREAT_COUNTER_PENALTY
-            elif forced_result is MoveResult.LOSS:
-                bonus += VERIFIED_SINGLE_SAFE_THREAT_WIN_BONUS
-            else:
-                second_undo = incremental_state.make_move(forced_block, child_position.side_to_move)
-                try:
-                    grandchild_position = incremental_state.to_position()
-                    grandchild_snapshot = self._tactics(grandchild_position, incremental_state, detail=TacticalDetail.BASIC)
-                    if grandchild_snapshot.winning_moves:
-                        bonus += VERIFIED_SINGLE_SAFE_THREAT_WIN_BONUS
-                    elif grandchild_snapshot.double_threats:
-                        bonus += VERIFIED_SINGLE_SAFE_THREAT_DOUBLE_BONUS
-                    elif grandchild_snapshot.safe_threats:
-                        bonus += VERIFIED_SINGLE_SAFE_THREAT_CHAIN_BONUS
-
-                    if grandchild_snapshot.opponent_winning_moves and len(grandchild_snapshot.forced_blocks) == 1:
-                        bonus += VERIFIED_SINGLE_SAFE_THREAT_RECURSIVE_BONUS
-                    elif grandchild_snapshot.opponent_winning_moves and not grandchild_snapshot.forced_blocks:
-                        bonus -= VERIFIED_SINGLE_SAFE_THREAT_COUNTER_PENALTY
-                finally:
-                    incremental_state.unmake_move(second_undo)
-        finally:
-            incremental_state.unmake_move(first_undo)
-
-        self.single_safe_threat_order_cache[key] = bonus
-        return bonus
-
     def _rank_moves(
         self,
         position: Position,
@@ -1821,21 +1645,6 @@ class SearchEngine:
             if move in critical_restricted_responses:
                 score += CRITICAL_RESTRICTED_RESPONSE_BONUS
             if move in safe_moves:
-                future_hint = (
-                    len(future_wins_by_move.get(move, ()))
-                    if use_snapshot_maps
-                    else future_win_counts.get(move, 0)
-                )
-                score += self._single_safe_threat_order_bonus(
-                    position,
-                    incremental_state,
-                    snapshot,
-                    move,
-                    future_hint,
-                    ply,
-                    is_pv,
-                    in_quiescence,
-                )
                 score += SAFE_MOVE_BONUS
             else:
                 score -= POISON_MOVE_PENALTY
